@@ -1,0 +1,15 @@
+# Build output
+bin/
+obj/
+
+# Visual Studio
+.vs/
+
+# SMAPI runtime data (game folder에만 존재)
+config.json
+state.json
+links.json
+
+# OS
+.DS_Store
+Thumbs.db

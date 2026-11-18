@@ -1,0 +1,10 @@
+{
+  "Name": "SOOP Stardew Bridge",
+  "Author": "LocalDev",
+  "Version": "1.0.0",
+  "Description": "A starter mod for SOOP integration.",
+  "UniqueID": "LocalDev.SoopStardewBridge",
+  "EntryDll": "SoopStardewBridge.dll",
+  "MinimumApiVersion": "4.0.0",
+  "UpdateKeys": []
+}

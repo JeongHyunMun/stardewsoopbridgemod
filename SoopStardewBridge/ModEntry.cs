@@ -27,7 +27,7 @@ namespace SoopStardewBridge
     // 보상 대기열(state.json)과 아이템 목록(loot.json)은 호스트(Docker 서버)에만 있다.
     // 플레이어 게임은 창을 띄우고 자기 인벤토리를 바꾸는 일만 하며, 필요한 정보는 SMAPI 멀티플레이 메시지로 주고받는다.
     internal sealed class PendingRequestMessage { public string Reason { get; set; } = "query"; }
-    internal sealed class PendingMessage        { public int Chests { get; set; } public int PremiumChests { get; set; } public string Reason { get; set; } = "query"; }
+    internal sealed class PendingMessage        { public int Chests { get; set; } public int PremiumChests { get; set; } public string Reason { get; set; } = "query"; public string LinkPageUrl { get; set; } = ""; }
     internal sealed class ClaimRequestMessage   { public string Kind { get; set; } = "all"; }   // chest | premiumChest | all
     internal sealed class GrantMessage          { public int Chests { get; set; } public int PremiumChests { get; set; } public int RemainingChests { get; set; } public int RemainingPremiumChests { get; set; } }
     internal sealed class ReturnMessage         { public int Chests { get; set; } public int PremiumChests { get; set; } }
@@ -219,6 +219,8 @@ namespace SoopStardewBridge
         private readonly ConcurrentQueue<Action> hostMainThreadActions = new();
         // 호스트: Central 폴링 때 함께 보내는 "지금 접속 중인 플레이어" 목록
         private volatile string[] onlineFarmerSnapshot = Array.Empty<string>();
+        // 호스트: Central이 알려 준 현재 인증 도메인 (config/central.json). 플레이어가 접속할 때 연결 페이지 주소로 알려 준다.
+        private volatile string centralPublicBaseUrl = "";
 
         // 플레이어 게임: 숨은 Edge (SOOP 채팅 연결용)
         private System.Diagnostics.Process? edgeProcess;
@@ -326,8 +328,8 @@ namespace SoopStardewBridge
                 ClientPendingPremiumChests = 0;
                 ClientWaiting = false;
                 clientOpening = false;
+                // 호스트의 답(Pending, reason=login)을 받으면 저장된 SOOP 연결을 다시 띄운다 (현재 인증 도메인을 그때 받는다).
                 SendToHost(MsgPendingRequest, new PendingRequestMessage { Reason = "login" });
-                ResumeSavedLink();   // 전에 /숲로그인 했으면 숨은 Edge를 다시 띄운다
                 return;
             }
 
@@ -481,6 +483,9 @@ namespace SoopStardewBridge
             ClientPendingPremiumChests = Math.Max(0, msg.PremiumChests);
             ClientWaiting = false;
 
+            // 접속 직후 한 번: 전에 /숲로그인 했으면 숨은 Edge를 다시 띄운다.
+            if (msg.Reason == "login") ResumeSavedLink(msg.LinkPageUrl);
+
             // 접속 직후나 새 보상이 들어왔을 때만 알린다 (창을 열어 조회한 경우는 창에 표시됨).
             if (msg.Reason != "query" && ClientPendingChests + ClientPendingPremiumChests > 0)
                 Game1.addHUDMessage(new HUDMessage(
@@ -628,7 +633,12 @@ namespace SoopStardewBridge
         {
             State.PendingChests.TryGetValue(farmerId, out int normal);
             State.PendingPremiumChests.TryGetValue(farmerId, out int premium);
-            SendToPlayer(farmerId, MsgPending, new PendingMessage { Chests = normal, PremiumChests = premium, Reason = reason });
+            string baseUrl = centralPublicBaseUrl;
+            SendToPlayer(farmerId, MsgPending, new PendingMessage
+            {
+                Chests = normal, PremiumChests = premium, Reason = reason,
+                LinkPageUrl = string.IsNullOrEmpty(baseUrl) ? "" : baseUrl + "/link/page"
+            });
         }
 
         private void OnHostPendingRequest(long fromId, PendingRequestMessage msg)
@@ -869,11 +879,19 @@ namespace SoopStardewBridge
         }
 
         // 전에 /숲로그인 했으면 접속할 때 숨은 Edge를 다시 띄운다 (SOOP 로그인이 유효하면 바로 연결된다).
-        private void ResumeSavedLink()
+        // currentPageUrl: 호스트가 알려 준 현재 인증 도메인의 연결 페이지. 관리자가 도메인을 바꿨으면 저장된 주소 대신 이걸 쓴다.
+        private void ResumeSavedLink(string? currentPageUrl)
         {
             if (!OperatingSystem.IsWindows()) return;
+            if (edgeProcess != null && !edgeProcess.HasExited) return;
             SavedLink? saved = Helper.Data.ReadJsonFile<SavedLink>(LinkFileFor(Game1.player.UniqueMultiplayerID));
             if (saved == null || string.IsNullOrEmpty(saved.SessionKey)) return;
+            if (!string.IsNullOrWhiteSpace(currentPageUrl) && currentPageUrl != saved.PageUrl)
+            {
+                Monitor.Log($"인증 도메인이 바뀌어 연결 페이지 주소를 갱신합니다: {currentPageUrl}", LogLevel.Info);
+                saved.PageUrl = currentPageUrl;
+                Helper.Data.WriteJsonFile(LinkFileFor(Game1.player.UniqueMultiplayerID), saved);
+            }
             if (StartEdge(saved))
                 ChatInfo("SOOP 방송 연결을 다시 시작합니다. (해제하려면 /숲로그아웃)");
         }
@@ -1191,6 +1209,7 @@ namespace SoopStardewBridge
                     {
                         var poll = JsonSerializer.Deserialize<CentralPollResponse>(json, JsonOptions);
                         if (poll?.Job != null) incomingCentralJobs.Enqueue(poll.Job);
+                        if (!string.IsNullOrWhiteSpace(poll?.PublicBaseUrl)) centralPublicBaseUrl = poll!.PublicBaseUrl!.TrimEnd('/');
                         // SOOP 연동 결과를 해당 플레이어 게임에 알린다 (게임 스레드에서 전송).
                         foreach (LinkEventDto ev in poll?.LinkEvents ?? new List<LinkEventDto>())
                         {
@@ -1881,6 +1900,7 @@ namespace SoopStardewBridge
             public bool        Ok  { get; set; }
             public CentralJob? Job { get; set; }
             public List<LinkEventDto>? LinkEvents { get; set; }
+            public string? PublicBaseUrl { get; set; }
         }
 
         private sealed class LinkEventDto

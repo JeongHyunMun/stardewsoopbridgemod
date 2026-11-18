@@ -23,10 +23,8 @@ namespace SoopStardewBridge
     internal sealed class ModEntry : Mod
     {
         private const string ChestItemId = "SoopStardewBridge_RewardChest";
-        private const string MailPrefix = "SoopStardewBridge_ChestMail_";
         private const string ChestTextureAsset = "SoopStardewBridge/reward_chest";
         private const int ChestSpriteIndex = 0;
-        private const int MaxMailEntries = 10000;
 
         private static readonly JsonSerializerOptions JsonOptions = new()
         {
@@ -185,26 +183,6 @@ namespace SoopStardewBridge
                         Texture = ChestTextureAsset,
                         SpriteIndex = ChestSpriteIndex
                     };
-                });
-                return;
-            }
-
-            if (e.NameWithoutLocale.IsEquivalentTo("Data/mail"))
-            {
-                e.Edit(asset =>
-                {
-                    var data = asset.AsDictionary<string, string>().Data;
-                    for (int i = 1; i <= MaxMailEntries; i++)
-                    {
-                        string mailId = MailPrefix + i;
-                        if (data.ContainsKey(mailId)) continue;
-                        data[mailId] =
-                            "안녕하세요!^^" +
-                            "SOOP 후원 보상 상자를 보내드립니다." +
-                            "^^후원해 주셔서 감사합니다!" +
-                            "%item id (O)" + ChestItemId +
-                            " 1 %%[#]SOOP 보상 상자";
-                    }
                 });
             }
         }
@@ -524,26 +502,25 @@ namespace SoopStardewBridge
                 Farmer? farmer = FindOnlineFarmer(farmerId);
                 if (farmer == null) continue;
 
-                int sent = 0;
-                while (sent < pending && state.NextMailNumber < MaxMailEntries)
+                // 즉시 인벤토리 지급. 인벤토리 꽉 찼으면 발 아래 드랍.
+                int given = 0;
+                for (int i = 0; i < pending; i++)
                 {
-                    int nextNumber = state.NextMailNumber + 1;
-                    string mailId = MailPrefix + nextNumber;
-                    state.NextMailNumber = nextNumber;
-                    if (farmer.hasOrWillReceiveMail(mailId)) continue;
-                    farmer.mailbox.Add(mailId);
-                    sent++;
-                    state.PendingChests[farmerId] = pending - sent;
-                    SaveState();
+                    var item = ItemRegistry.Create(ChestItemId, 1);
+                    if (farmer.couldInventoryAcceptThisItem(item))
+                    {
+                        farmer.addItemToInventoryBool(item);
+                    }
+                    else
+                    {
+                        Game1.createItemDebris(item, farmer.getStandingPosition(), -1, farmer.currentLocation);
+                    }
+                    given++;
                 }
 
-                int remaining = pending - sent;
-                if (remaining <= 0) state.PendingChests.Remove(farmerId);
-                else state.PendingChests[farmerId] = remaining;
-
-                if (sent > 0) Monitor.Log($"보상 우편 등록: FarmerId={farmerId}, 수량={sent}", LogLevel.Info);
-                if (remaining > 0 && state.NextMailNumber >= MaxMailEntries)
-                    Monitor.Log("편지 ID 한도에 도달했습니다. 남은 보상은 대기 상태입니다.", LogLevel.Warn);
+                state.PendingChests.Remove(farmerId);
+                SaveState();
+                Monitor.Log($"보상 상자 즉시 지급: FarmerId={farmerId}, 수량={given}", LogLevel.Info);
             }
 
             foreach (var entry in state.PendingMonsters.ToArray())
@@ -631,7 +608,6 @@ namespace SoopStardewBridge
             public List<string> ProcessedEventIds { get; set; } = new();
             public Dictionary<long, int> PendingChests { get; set; } = new();
             public Dictionary<long, int> PendingMonsters { get; set; } = new();
-            public int NextMailNumber { get; set; }
         }
     }
 }

@@ -37,6 +37,7 @@ namespace SoopStardewBridge
     internal sealed class LinkResponseMessage   { public string LoginUrl { get; set; } = ""; public string PageUrl { get; set; } = ""; public string SessionKey { get; set; } = ""; public string Error { get; set; } = ""; }
     internal sealed class UnlinkRequestMessage  { }
     internal sealed class UnlinkResponseMessage { public bool Ok { get; set; } public string Error { get; set; } = ""; }
+    internal sealed class LinkStatusMessage     { public string Kind { get; set; } = "info"; public string Message { get; set; } = ""; }   // info | success | error
     internal sealed class SavedLink             { public string PageUrl { get; set; } = ""; public string SessionKey { get; set; } = ""; public string SavedAt { get; set; } = ""; }
 
     // ── 보상 수령 UI (플레이어 게임에서 표시) ──────────────────────────────
@@ -187,6 +188,7 @@ namespace SoopStardewBridge
         private const string MsgLinkResponse   = "LinkResponse";    // 호스트 → 플레이어 (로그인 주소, 세션 키)
         private const string MsgUnlinkRequest  = "UnlinkRequest";   // 플레이어 → 호스트 (/숲로그아웃)
         private const string MsgUnlinkResponse = "UnlinkResponse";  // 호스트 → 플레이어
+        private const string MsgLinkStatus     = "LinkStatus";      // 호스트 → 플레이어 (SOOP 연동 성공/실패 알림)
 
         private static readonly JsonSerializerOptions JsonOptions = new()
         {
@@ -211,6 +213,7 @@ namespace SoopStardewBridge
         private bool     clientOpening;
         private DateTime clientOpeningSince;
         private bool     clientLinkPending;
+        private DateTime? clientLinkWaitingSince;   // /숲로그인 후 결과를 기다리는 중
 
         // 호스트: Central 응답을 게임 스레드에서 플레이어에게 보내기 위한 대기열
         private readonly ConcurrentQueue<Action> hostMainThreadActions = new();
@@ -361,6 +364,13 @@ namespace SoopStardewBridge
             {
                 clientOpening = false;
                 Game1.addHUDMessage(new HUDMessage("서버가 응답하지 않아 상자를 열지 못했습니다.", HUDMessage.error_type));
+            }
+
+            // /숲로그인 후 3분 동안 결과가 없으면 안내한다.
+            if (clientLinkWaitingSince is DateTime since && (DateTime.UtcNow - since).TotalMinutes > 3)
+            {
+                clientLinkWaitingSince = null;
+                ChatError("아직 SOOP 연동이 완료되지 않았습니다. 브라우저에서 SOOP 로그인을 마쳤는지 확인하고, 안 되면 /숲로그인을 다시 해 주세요.");
             }
 
             if (!Context.IsWorldReady || !Context.IsMainPlayer) return;
@@ -741,6 +751,7 @@ namespace SoopStardewBridge
                         case MsgOpenResult: HandleClientMessage(e.Type, e.ReadAs<OpenResultMessage>()); break;
                         case MsgLinkResponse:   HandleClientMessage(e.Type, e.ReadAs<LinkResponseMessage>());   break;
                         case MsgUnlinkResponse: HandleClientMessage(e.Type, e.ReadAs<UnlinkResponseMessage>()); break;
+                        case MsgLinkStatus:     HandleClientMessage(e.Type, e.ReadAs<LinkStatusMessage>());     break;
                     }
                 }
             }
@@ -772,6 +783,7 @@ namespace SoopStardewBridge
                 case OpenResultMessage m when type == MsgOpenResult: OnClientOpenResult(m); break;
                 case LinkResponseMessage m   when type == MsgLinkResponse:   OnClientLinkResponse(m);   break;
                 case UnlinkResponseMessage m when type == MsgUnlinkResponse: OnClientUnlinkResponse(m); break;
+                case LinkStatusMessage m     when type == MsgLinkStatus:     OnClientLinkStatus(m);     break;
             }
         }
 
@@ -822,12 +834,37 @@ namespace SoopStardewBridge
             try
             {
                 Process.Start(new ProcessStartInfo(msg.LoginUrl) { UseShellExecute = true });
-                ChatInfo("브라우저에서 SOOP 로그인을 마치면 내 방송의 후원을 받기 시작합니다.");
+                clientLinkWaitingSince = DateTime.UtcNow;
+                ChatInfo("브라우저에서 SOOP 로그인을 마치면 연동 결과가 여기에 표시됩니다.");
             }
             catch (Exception ex)
             {
                 Monitor.Log($"기본 브라우저 열기 실패: {ex.Message}", LogLevel.Warn);
                 ChatError($"브라우저를 열지 못했습니다. 이 주소를 직접 열어 주세요: {msg.LoginUrl}");
+            }
+        }
+
+        // Central이 알려 준 연동 결과를 채팅창과 화면 알림으로 표시한다.
+        private void OnClientLinkStatus(LinkStatusMessage msg)
+        {
+            if (string.IsNullOrWhiteSpace(msg.Message)) return;
+            switch (msg.Kind)
+            {
+                case "success":
+                    clientLinkWaitingSince = null;
+                    ChatInfo(msg.Message);
+                    Game1.addHUDMessage(new HUDMessage(msg.Message, HUDMessage.achievement_type));
+                    Game1.playSound("reward");
+                    break;
+                case "error":
+                    clientLinkWaitingSince = null;
+                    ChatError(msg.Message);
+                    Game1.addHUDMessage(new HUDMessage(msg.Message, HUDMessage.error_type));
+                    Game1.playSound("cancel");
+                    break;
+                default:
+                    ChatInfo(msg.Message);
+                    break;
             }
         }
 
@@ -1154,6 +1191,14 @@ namespace SoopStardewBridge
                     {
                         var poll = JsonSerializer.Deserialize<CentralPollResponse>(json, JsonOptions);
                         if (poll?.Job != null) incomingCentralJobs.Enqueue(poll.Job);
+                        // SOOP 연동 결과를 해당 플레이어 게임에 알린다 (게임 스레드에서 전송).
+                        foreach (LinkEventDto ev in poll?.LinkEvents ?? new List<LinkEventDto>())
+                        {
+                            if (!long.TryParse(ev.FarmerId, out long target)) continue;
+                            var status = new LinkStatusMessage { Kind = ev.Kind, Message = ev.Message };
+                            hostMainThreadActions.Enqueue(() => { if (FindOnlineFarmer(target) != null) SendToPlayer(target, MsgLinkStatus, status); });
+                            Monitor.Log($"SOOP 연동 알림 → FarmerId={target}: {ev.Message}", LogLevel.Info);
+                        }
                     }
                     else if ((int)resp.StatusCode == 401)
                     {
@@ -1835,6 +1880,14 @@ namespace SoopStardewBridge
         {
             public bool        Ok  { get; set; }
             public CentralJob? Job { get; set; }
+            public List<LinkEventDto>? LinkEvents { get; set; }
+        }
+
+        private sealed class LinkEventDto
+        {
+            public string FarmerId { get; set; } = "";
+            public string Kind     { get; set; } = "info";
+            public string Message  { get; set; } = "";
         }
 
         private sealed class CentralJob

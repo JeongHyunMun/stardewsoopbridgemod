@@ -208,8 +208,16 @@ namespace SoopStardewBridge
         private readonly Random                         random              = new();
         private readonly HttpClient                     centralHttp         = new() { Timeout = TimeSpan.FromSeconds(12) };
 
-        private BridgeConfig config = new();
+        // config/rules는 백그라운드 타이머가 교체하고 다른 스레드가 읽으므로 volatile로 둔다.
+        private volatile BridgeConfig config = new();
+        private volatile RulesFile    rules  = RulesFile.CreateDefault();
         public  BridgeState  State  = new();
+
+        private const string ConfigFileName = "config.json";
+        private const string RulesFileName  = "rules.json";
+        private DateTime configWriteUtc;
+        private DateTime rulesWriteUtc;
+        private System.Threading.Timer? hotReloadTimer;
 
         private HttpListener?            listener;
         private CancellationTokenSource? listenerCancellation;
@@ -229,6 +237,10 @@ namespace SoopStardewBridge
 
             State = Helper.Data.ReadJsonFile<BridgeState>("state.json") ?? new BridgeState();
 
+            configWriteUtc = StampOf(ConfigFileName);
+            EnsureRulesFile();
+            ReloadRules(force: true);
+
             Helper.Events.GameLoop.SaveLoaded    += OnSaveLoaded;
             Helper.Events.GameLoop.DayStarted    += OnDayStarted;
             Helper.Events.GameLoop.UpdateTicked  += OnUpdateTicked;
@@ -237,6 +249,9 @@ namespace SoopStardewBridge
 
             StartHttpListener();
             StartCentralPolling();
+
+            // 2초마다 config.json / rules.json 수정 여부를 확인한다. 게임 루프와 무관하게 동작한다.
+            hotReloadTimer = new System.Threading.Timer(_ => HotReload(), null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(2));
 
             Monitor.Log("SOOP Stardew Bridge가 시작되었습니다.", LogLevel.Info);
             Monitor.Log($"로컬 후원 수신 주소: http://127.0.0.1:{config.Port}/event", LogLevel.Info);
@@ -506,23 +521,37 @@ namespace SoopStardewBridge
 
         private void StartCentralPolling()
         {
-            if (string.IsNullOrWhiteSpace(config.CentralServerUrl) ||
-                string.IsNullOrWhiteSpace(config.AgentToken)) return;
-
             centralCancellation = new CancellationTokenSource();
             _ = CentralPollingLoopAsync(centralCancellation.Token);
-            Monitor.Log("Central 서버 폴링을 시작했습니다.", LogLevel.Info);
         }
 
         private async Task CentralPollingLoopAsync(CancellationToken ct)
         {
-            string baseUrl = config.CentralServerUrl.TrimEnd('/');
+            string announced = "";
             while (!ct.IsCancellationRequested)
             {
+                // 매 루프마다 최신 config를 읽는다. CentralServerUrl/AgentToken/PollIntervalSeconds를 고치면 바로 반영된다.
+                BridgeConfig cfg = config;
+
+                if (string.IsNullOrWhiteSpace(cfg.CentralServerUrl) || string.IsNullOrWhiteSpace(cfg.AgentToken))
+                {
+                    announced = "";
+                    try { await Task.Delay(TimeSpan.FromSeconds(5), ct).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { break; }
+                    continue;
+                }
+
+                string baseUrl = cfg.CentralServerUrl.TrimEnd('/');
+                if (announced != baseUrl)
+                {
+                    Monitor.Log($"Central 서버 폴링 중: {baseUrl}", LogLevel.Info);
+                    announced = baseUrl;
+                }
+
                 try
                 {
                     using var req = new HttpRequestMessage(HttpMethod.Post, baseUrl + "/api/agent/poll");
-                    req.Headers.Add("X-Agent-Token", config.AgentToken);
+                    req.Headers.Add("X-Agent-Token", cfg.AgentToken);
                     req.Content = new StringContent("{}", Encoding.UTF8, "application/json");
                     using HttpResponseMessage resp = await centralHttp.SendAsync(req, ct).ConfigureAwait(false);
                     string json = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
@@ -541,7 +570,7 @@ namespace SoopStardewBridge
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
                 catch (Exception ex) { Monitor.Log($"Central 연결 오류(재시도 예정): {ex.Message}", LogLevel.Trace); }
 
-                try { await Task.Delay(TimeSpan.FromSeconds(8), ct).ConfigureAwait(false); }
+                try { await Task.Delay(TimeSpan.FromSeconds(Math.Max(2, cfg.PollIntervalSeconds)), ct).ConfigureAwait(false); }
                 catch (OperationCanceledException) { break; }
             }
         }
@@ -671,19 +700,8 @@ namespace SoopStardewBridge
             if (targetFarmerId == null)
             { Monitor.Log($"FarmerId 없음 (soopId={soopId})", LogLevel.Warn); RememberEvent(eventId); return; }
 
-            int balloons = donation.Balloons, chests = 0, monsters = 0;
-            if (config.TestMode)
-            {
-                if (balloons == 1) monsters = 1;
-                else if (balloons == 2) chests = 1;
-                else if (balloons == 3) chests = 11;
-            }
-            else
-            {
-                if (balloons >= 33) monsters = 1;
-                if (balloons == 1000) chests = 11;
-                else if (balloons >= 100 && balloons < 1000) chests = balloons / 100;
-            }
+            int balloons = donation.Balloons;
+            var (chests, monsters) = ComputeRewards(rules, balloons);   // rules.json 기준
 
             if (chests == 0 && monsters == 0)
             { RememberEvent(eventId); Monitor.Log($"보상 기준 미달: {soopId}, {balloons}개", LogLevel.Info); return; }
@@ -735,6 +753,179 @@ namespace SoopStardewBridge
 
         public void SaveState() => Helper.Data.WriteJsonFile("state.json", State);
 
+        // ── 설정 자동 재로드 (config.json / rules.json) ──────────────────────
+        // DLL을 바꾸지 않아도 두 파일을 수정하면 2초 안에 반영된다.
+        // 파일이 잘못되어 있으면 오류를 로그에 남기고 이전 값을 그대로 쓴다.
+
+        private DateTime StampOf(string fileName)
+        {
+            string path = Path.Combine(Helper.DirectoryPath, fileName);
+            return File.Exists(path) ? File.GetLastWriteTimeUtc(path) : DateTime.MinValue;
+        }
+
+        private void HotReload()
+        {
+            try
+            {
+                ReloadConfig();
+                ReloadRules(force: false);
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"설정 자동 재로드 오류: {ex.Message}", LogLevel.Warn);
+            }
+        }
+
+        private void ReloadConfig()
+        {
+            DateTime stamp = StampOf(ConfigFileName);
+            if (stamp == configWriteUtc || stamp == DateTime.MinValue) return;
+            configWriteUtc = stamp;
+
+            try
+            {
+                // Helper.ReadConfig는 읽을 때마다 파일을 다시 써서 수정 시각이 바뀌므로
+                // (그러면 자기 자신을 변경으로 감지해 무한 반복된다) 쓰기 없는 ReadJsonFile을 쓴다.
+                BridgeConfig? loaded = Helper.Data.ReadJsonFile<BridgeConfig>(ConfigFileName);
+                if (loaded == null)
+                {
+                    Monitor.Log("config.json이 비어 있어 이전 설정을 유지합니다.", LogLevel.Error);
+                    return;
+                }
+                BridgeConfig current = config;
+
+                if (string.IsNullOrWhiteSpace(loaded.AuthToken))
+                    loaded.AuthToken = current.AuthToken;   // 토큰을 비워도 기존 값을 유지한다.
+                if (loaded.Port != current.Port)
+                {
+                    Monitor.Log($"Port 변경({current.Port} → {loaded.Port})은 서버 재시작 후 적용됩니다. 지금은 {current.Port}를 계속 사용합니다.", LogLevel.Warn);
+                    loaded.Port = current.Port;
+                }
+
+                config = loaded;
+                Monitor.Log("config.json 변경을 반영했습니다.", LogLevel.Info);
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"config.json 오류, 이전 설정을 유지합니다: {ex.Message}", LogLevel.Error);
+            }
+        }
+
+        private void EnsureRulesFile()
+        {
+            if (File.Exists(Path.Combine(Helper.DirectoryPath, RulesFileName))) return;
+            Helper.Data.WriteJsonFile(RulesFileName, RulesFile.CreateDefault());
+            Monitor.Log("rules.json이 없어 기본 규칙으로 만들었습니다.", LogLevel.Info);
+        }
+
+        private void ReloadRules(bool force)
+        {
+            DateTime stamp = StampOf(RulesFileName);
+            if (stamp == DateTime.MinValue) return;
+            if (!force && stamp == rulesWriteUtc) return;
+            rulesWriteUtc = stamp;
+
+            try
+            {
+                RulesFile? loaded = Helper.Data.ReadJsonFile<RulesFile>(RulesFileName);
+                if (loaded == null)
+                {
+                    Monitor.Log("rules.json이 비어 있어 이전 규칙을 유지합니다.", LogLevel.Error);
+                    return;
+                }
+
+                string? error = ValidateRules(loaded);
+                if (error != null)
+                {
+                    Monitor.Log($"rules.json 오류, 이전 규칙을 유지합니다: {error}", LogLevel.Error);
+                    return;
+                }
+
+                rules = loaded;
+                Monitor.Log($"보상 규칙을 반영했습니다: {loaded.Rules.Count}개", LogLevel.Info);
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"rules.json을 읽지 못해 이전 규칙을 유지합니다: {ex.Message}", LogLevel.Error);
+            }
+        }
+
+        // 규칙 형식은 Central의 config/rules.json과 같다.
+        private static string? ValidateRules(RulesFile file)
+        {
+            if (file.Rules == null || file.Rules.Count == 0)
+                return "rules 배열이 비어 있습니다.";
+
+            for (int i = 0; i < file.Rules.Count; i++)
+            {
+                RewardRule r = file.Rules[i];
+                string at = $"rules[{i}]";
+
+                if (r.Type != "chest" && r.Type != "monster") return $"{at}: type은 chest 또는 monster여야 합니다.";
+                if (r.MinBalloons   is < 1) return $"{at}: minBalloons는 1 이상이어야 합니다.";
+                if (r.MaxBalloons   is < 1) return $"{at}: maxBalloons는 1 이상이어야 합니다.";
+                if (r.ExactBalloons is < 1) return $"{at}: exactBalloons는 1 이상이어야 합니다.";
+                if (r.PerBalloons   is < 1) return $"{at}: perBalloons는 1 이상이어야 합니다.";
+                if (r.Amount        is < 1) return $"{at}: amount는 1 이상이어야 합니다.";
+                if (r.ExactBalloons.HasValue && (r.MinBalloons.HasValue || r.MaxBalloons.HasValue))
+                    return $"{at}: exactBalloons는 minBalloons/maxBalloons와 함께 쓸 수 없습니다.";
+                if (r.MinBalloons.HasValue && r.MaxBalloons.HasValue && r.MaxBalloons < r.MinBalloons)
+                    return $"{at}: maxBalloons는 minBalloons보다 작을 수 없습니다.";
+                if (r.PerBalloons.HasValue && r.Amount.HasValue)
+                    return $"{at}: perBalloons와 amount는 함께 쓸 수 없습니다.";
+            }
+
+            return null;
+        }
+
+        // 조건에 맞는 모든 규칙의 수량을 type별로 합산한다.
+        private static (int chests, int monsters) ComputeRewards(RulesFile file, int balloons)
+        {
+            const int MaxAmount = 1000;
+            int chests = 0, monsters = 0;
+
+            foreach (RewardRule r in file.Rules)
+            {
+                bool matches = r.ExactBalloons.HasValue
+                    ? balloons == r.ExactBalloons.Value
+                    : balloons >= (r.MinBalloons ?? 1) && balloons <= (r.MaxBalloons ?? int.MaxValue);
+                if (!matches) continue;
+
+                int amount = r.PerBalloons.HasValue ? balloons / r.PerBalloons.Value : (r.Amount ?? 1);
+                if (amount < 1) continue;
+
+                if (r.Type == "chest") chests += amount; else monsters += amount;
+            }
+
+            return (Math.Min(chests, MaxAmount), Math.Min(monsters, MaxAmount));
+        }
+
+        private sealed class RulesFile
+        {
+            public List<RewardRule> Rules { get; set; } = new();
+
+            public static RulesFile CreateDefault() => new()
+            {
+                Rules = new List<RewardRule>
+                {
+                    new() { Name = "monster-33",    Type = "monster", MinBalloons = 33, Amount = 1 },
+                    new() { Name = "chest-per-100", Type = "chest",   MinBalloons = 100, MaxBalloons = 999, PerBalloons = 100 },
+                    new() { Name = "chest-1000",    Type = "chest",   ExactBalloons = 1000, Amount = 11 }
+                }
+            };
+        }
+
+        private sealed class RewardRule
+        {
+            public string Name          { get; set; } = "";
+            public string Type          { get; set; } = "";
+            public int?   MinBalloons   { get; set; }
+            public int?   MaxBalloons   { get; set; }
+            public int?   ExactBalloons { get; set; }
+            public int?   PerBalloons   { get; set; }
+            public int?   Amount        { get; set; }
+        }
+
         // ── 데이터 클래스 ────────────────────────────────────────────────────
 
         private sealed class BridgeConfig
@@ -743,7 +934,7 @@ namespace SoopStardewBridge
             public string AuthToken        { get; set; } = "";
             public string CentralServerUrl { get; set; } = "";
             public string AgentToken       { get; set; } = "";
-            public bool   TestMode         { get; set; } = true;
+            public int    PollIntervalSeconds { get; set; } = 8;
         }
 
         private sealed class DonationEvent

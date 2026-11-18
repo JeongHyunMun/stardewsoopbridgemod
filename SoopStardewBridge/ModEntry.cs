@@ -470,16 +470,18 @@ namespace SoopStardewBridge
                 return true;
             }
 
-            if (job.FarmerId == null || job.FarmerId <= 0)
+            long? farmerIdLong = job.GetFarmerIdLong();
+
+            if (farmerIdLong == null || farmerIdLong <= 0)
             {
                 Monitor.Log($"Central 작업 처리 불가: FarmerId 없음 (jobId={job.Id}, soopId={job.SoopId}). 관리자 페이지에서 FarmerId를 등록하세요.", LogLevel.Warn);
                 return false;
             }
 
             if (job.RewardType == "chest")
-                AddPending(state.PendingChests, job.FarmerId.Value, job.Amount);
+                AddPending(state.PendingChests, farmerIdLong.Value, job.Amount);
             else if (job.RewardType == "monster")
-                AddPending(state.PendingMonsters, job.FarmerId.Value, job.Amount);
+                AddPending(state.PendingMonsters, farmerIdLong.Value, job.Amount);
             else
             {
                 Monitor.Log($"Central 작업: 알 수 없는 보상 종류 '{job.RewardType}'", LogLevel.Warn);
@@ -487,7 +489,7 @@ namespace SoopStardewBridge
             }
 
             RememberEvent(jobKey);
-            Monitor.Log($"Central 보상 접수: jobId={job.Id}, SOOP={job.SoopId}, 종류={job.RewardType}, 수량={job.Amount}, FarmerId={job.FarmerId}", LogLevel.Info);
+            Monitor.Log($"Central 보상 접수: jobId={job.Id}, SOOP={job.SoopId}, 종류={job.RewardType}, 수량={job.Amount}, FarmerId={farmerIdLong}", LogLevel.Info);
             ProcessPendingRewards();
             return true;
         }
@@ -611,10 +613,17 @@ namespace SoopStardewBridge
         {
             public string Id { get; set; } = "";
             public string SoopId { get; set; } = "";
-            public long? FarmerId { get; set; }
+            // JSON에서 string으로 수신 후 long으로 파싱 (JS Number 정밀도 손실 방지)
+            public string? FarmerId { get; set; }
             public string RewardType { get; set; } = "";
             public int Amount { get; set; }
             public string Reason { get; set; } = "";
+
+            public long? GetFarmerIdLong()
+            {
+                if (string.IsNullOrWhiteSpace(FarmerId)) return null;
+                return long.TryParse(FarmerId, out long v) ? v : null;
+            }
         }
 
         private sealed class BridgeState

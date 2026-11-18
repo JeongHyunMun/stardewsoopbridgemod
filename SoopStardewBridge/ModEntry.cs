@@ -748,6 +748,7 @@ namespace SoopStardewBridge
                     MonsterEntry pick = RollMonster();
                     farmer.currentLocation.characters.Add(CreateMonster(pick.Type, spawn * 64f));
                     spawnedNames.Add(string.IsNullOrWhiteSpace(pick.Name) ? pick.Type : pick.Name);
+                    AnnounceRareMonster(farmer, pick);
                 }
                 State.PendingMonsters.Remove(farmerId);
                 Monitor.Log($"몬스터 소환 완료: FarmerId={farmerId}, 수량={entry.Value}, 종류={string.Join(", ", spawnedNames)}", LogLevel.Info);
@@ -1424,8 +1425,36 @@ namespace SoopStardewBridge
                 MonsterEntry m = file.Monsters[i];
                 if (!MonsterTypes.Contains(m.Type)) return $"monsters[{i}]: type '{m.Type}'은 지원하지 않습니다. 사용 가능: {string.Join(", ", MonsterTypes)}";
                 if (!(m.Weight > 0)) return $"monsters[{i}]: weight는 0보다 커야 합니다.";
+                if (m.Rarity is not ("common" or "rare" or "veryRare")) return $"monsters[{i}]: rarity는 common, rare, veryRare 중 하나여야 합니다.";
             }
             return null;
+        }
+
+        // 드묾(rare)/아주 드묾(veryRare) 몬스터가 나오면 모든 플레이어 채팅창에 알린다.
+        // 서버가 보내는 일반 채팅이라 플레이어 쪽 모드가 옛 버전이어도 보인다.
+        private void AnnounceRareMonster(Farmer farmer, MonsterEntry pick)
+        {
+            MonstersFile file = monsters;
+            string? template = pick.Rarity switch
+            {
+                "rare"     => file.RareMessage,
+                "veryRare" => file.VeryRareMessage,
+                _          => null
+            };
+            if (string.IsNullOrWhiteSpace(template)) return;
+
+            string monsterName = string.IsNullOrWhiteSpace(pick.Name) ? pick.Type : pick.Name;
+            string text = template.Replace("{player}", farmer.Name).Replace("{monster}", monsterName);
+            try
+            {
+                Game1.Multiplayer.sendChatMessage(LocalizedContentManager.CurrentLanguageCode, text, Multiplayer.AllPlayers);
+                Game1.chatBox?.addInfoMessage(text);   // 호스트가 직접 플레이하는 경우 자기 화면에도 표시
+                Monitor.Log($"희귀 몬스터 안내: {text}", LogLevel.Info);
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"희귀 몬스터 안내 실패: {ex.Message}", LogLevel.Warn);
+            }
         }
 
         private MonsterEntry RollMonster()
@@ -1446,20 +1475,30 @@ namespace SoopStardewBridge
             public string Name   { get; set; } = "";   // 사람이 읽기 위한 이름 (로그에 표시)
             public string Type   { get; set; } = "GreenSlime";
             public double Weight { get; set; }
+            public string Rarity { get; set; } = "common";   // common | rare(드묾) | veryRare(아주 드묾)
         }
 
         private sealed class MonstersFile
         {
+            // {player} = 소환된 플레이어 이름, {monster} = 몬스터 이름. 비워 두면 안내하지 않는다.
+            public string RareMessage     { get; set; } = "[희귀 몬스터 등장] {player} 근처에 {monster}이(가) 나타났습니다!";
+            public string VeryRareMessage { get; set; } = "[초희귀 몬스터 등장] {player} 근처에 {monster}이(가) 나타났습니다! 조심하세요!";
             public List<MonsterEntry> Monsters { get; set; } = new();
 
-            private static MonsterEntry M(string name, string type, double weight) => new() { Name = name, Type = type, Weight = weight };
+            private static MonsterEntry M(string name, string type, double weight, string rarity = "common") => new() { Name = name, Type = type, Weight = weight, Rarity = rarity };
 
             public static MonstersFile CreateDefault() => new()
             {
                 Monsters = new List<MonsterEntry>
                 {
-                    M("초록 슬라임", "GreenSlime", 40), M("박쥐", "Bat", 20), M("파란 슬라임", "FrostJelly", 15),
-                    M("바위 게", "RockCrab", 10), M("빨간 슬라임", "RedSlime", 10), M("그림자 무사", "ShadowBrute", 5)
+                    M("초록 슬라임", "GreenSlime", 24), M("파란 슬라임", "FrostJelly", 13), M("박쥐", "Bat", 12),
+                    M("벌레", "Bug", 10), M("애벌레", "Grub", 10),
+                    M("빨간 슬라임", "RedSlime", 5), M("서리 박쥐", "FrostBat", 5), M("먼지 정령", "DustSpirit", 5),
+                    M("동굴 파리", "Fly", 4), M("바위 게", "RockCrab", 4), M("두더지", "Duggy", 4),
+                    M("용암 박쥐", "LavaBat", 1, "rare"), M("유령", "Ghost", 0.75, "rare"),
+                    M("해골", "Skeleton", 0.75, "rare"), M("그림자 무사", "ShadowBrute", 0.75, "rare"),
+                    M("그림자 주술사", "ShadowShaman", 0.25, "veryRare"), M("미라", "Mummy", 0.25, "veryRare"),
+                    M("날개 달린 뱀", "Serpent", 0.25, "veryRare")
                 }
             };
         }

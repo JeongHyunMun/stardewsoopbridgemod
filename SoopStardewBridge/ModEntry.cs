@@ -205,12 +205,15 @@ namespace SoopStardewBridge
         private volatile BridgeConfig config = new();
         private volatile RulesFile    rules  = RulesFile.CreateDefault();
         private volatile LootFile     loot   = LootFile.CreateDefault();
+        private volatile MonstersFile monsters = MonstersFile.CreateDefault();
         private volatile bool         lootNeedsCheck = true;
         public  BridgeState  State  = new();
 
         private const string ConfigFileName = "config.json";
         private const string RulesFileName  = "rules.json";
         private const string LootFileName   = "loot.json";
+        private const string MonstersFileName = "monsters.json";
+        private DateTime monstersWriteUtc;
         private DateTime configWriteUtc;
         private DateTime rulesWriteUtc;
         private DateTime lootWriteUtc;
@@ -239,6 +242,8 @@ namespace SoopStardewBridge
             ReloadRules(force: true);
             EnsureLootFile();
             ReloadLoot(force: true);
+            EnsureMonstersFile();
+            ReloadMonsters(force: true);
 
             Helper.Events.GameLoop.SaveLoaded             += OnSaveLoaded;
             Helper.Events.GameLoop.DayStarted             += OnDayStarted;
@@ -735,14 +740,17 @@ namespace SoopStardewBridge
                 Farmer? farmer = FindOnlineFarmer(farmerId);
                 if (farmer?.currentLocation == null) continue;
 
+                var spawnedNames = new List<string>();
                 for (int i = 0; i < entry.Value; i++)
                 {
                     Vector2 tile  = farmer.Tile;
                     Vector2 spawn = new(tile.X + random.Next(-3, 4), tile.Y + random.Next(-3, 4));
-                    farmer.currentLocation.characters.Add(new GreenSlime(spawn * 64f));
+                    MonsterEntry pick = RollMonster();
+                    farmer.currentLocation.characters.Add(CreateMonster(pick.Type, spawn * 64f));
+                    spawnedNames.Add(string.IsNullOrWhiteSpace(pick.Name) ? pick.Type : pick.Name);
                 }
                 State.PendingMonsters.Remove(farmerId);
-                Monitor.Log($"몬스터 소환 완료: FarmerId={farmerId}, 수량={entry.Value}", LogLevel.Info);
+                Monitor.Log($"몬스터 소환 완료: FarmerId={farmerId}, 수량={entry.Value}, 종류={string.Join(", ", spawnedNames)}", LogLevel.Info);
                 SaveState();
             }
         }
@@ -1059,6 +1067,7 @@ namespace SoopStardewBridge
                 ReloadConfig();
                 ReloadRules(force: false);
                 ReloadLoot(force: false);
+                ReloadMonsters(force: false);
             }
             catch (Exception ex)
             {
@@ -1338,6 +1347,119 @@ namespace SoopStardewBridge
                     I("스피드-그로", "(O)465", 5, 12), I("얼어붙은 정동석", "(O)536", 2, 10), I("금 주괴", "(O)336", 2, 10),
                     I("마그마 정동석", "(O)537", 2, 8), I("고급 스프링클러", "(O)621", 1, 6), I("오색 정동석", "(O)749", 1, 4),
                     I("이리듐 광석", "(O)386", 3, 3), I("다이아몬드", "(O)72", 1, 1.5), I("프리즘 조각", "(O)74", 1, 0.5)
+                }
+            };
+        }
+
+        // ── 몬스터 목록 (monsters.json) ──────────────────────────────────────
+        // 몬스터 보상 1마리마다 weight(확률 가중치)에 따라 종류를 뽑는다. 파일을 고치면 2초 안에 반영된다.
+        // type에는 아래 CreateMonster에 있는 이름만 쓸 수 있다 (임의 클래스 생성을 막기 위해 목록을 고정).
+
+        private static readonly string[] MonsterTypes =
+        {
+            "GreenSlime", "FrostJelly", "RedSlime", "Bat", "FrostBat", "LavaBat", "Bug", "Grub", "Fly",
+            "DustSpirit", "RockCrab", "Duggy", "Ghost", "Skeleton", "ShadowBrute", "ShadowShaman", "Mummy", "Serpent"
+        };
+
+        private static Monster CreateMonster(string type, Vector2 position) => type switch
+        {
+            "FrostJelly"   => new GreenSlime(position, 40),   // 광산 40층대 슬라임 (파란색)
+            "RedSlime"     => new GreenSlime(position, 80),   // 광산 80층대 슬라임 (빨간색)
+            "Bat"          => new Bat(position),
+            "FrostBat"     => new Bat(position, 40),
+            "LavaBat"      => new Bat(position, 80),
+            "Bug"          => new Bug(position, 0),
+            "Grub"         => new Grub(position),
+            "Fly"          => new Fly(position),
+            "DustSpirit"   => new DustSpirit(position),
+            "RockCrab"     => new RockCrab(position),
+            "Duggy"        => new Duggy(position),
+            "Ghost"        => new Ghost(position),
+            "Skeleton"     => new Skeleton(position, false),
+            "ShadowBrute"  => new ShadowBrute(position),
+            "ShadowShaman" => new ShadowShaman(position),
+            "Mummy"        => new Mummy(position),
+            "Serpent"      => new Serpent(position),
+            _              => new GreenSlime(position)
+        };
+
+        private void EnsureMonstersFile()
+        {
+            if (File.Exists(Path.Combine(Helper.DirectoryPath, MonstersFileName))) return;
+            Helper.Data.WriteJsonFile(MonstersFileName, MonstersFile.CreateDefault());
+            Monitor.Log("monsters.json이 없어 기본 몬스터 목록으로 만들었습니다.", LogLevel.Info);
+        }
+
+        private void ReloadMonsters(bool force)
+        {
+            DateTime stamp = StampOf(MonstersFileName);
+            if (stamp == DateTime.MinValue) return;
+            if (!force && stamp == monstersWriteUtc) return;
+            monstersWriteUtc = stamp;
+
+            try
+            {
+                MonstersFile? loaded = Helper.Data.ReadJsonFile<MonstersFile>(MonstersFileName);
+                string? error = loaded == null ? "파일이 비어 있습니다." : ValidateMonsters(loaded);
+                if (error != null)
+                {
+                    Monitor.Log($"monsters.json 오류, 이전 목록을 유지합니다: {error}", LogLevel.Error);
+                    return;
+                }
+
+                monsters = loaded!;
+                Monitor.Log($"몬스터 목록을 반영했습니다: {loaded!.Monsters.Count}종 (가중치 합 {loaded.Monsters.Sum(m => m.Weight):0.##})", LogLevel.Info);
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"monsters.json을 읽지 못해 이전 목록을 유지합니다: {ex.Message}", LogLevel.Error);
+            }
+        }
+
+        private static string? ValidateMonsters(MonstersFile file)
+        {
+            if (file.Monsters == null || file.Monsters.Count == 0) return "monsters 목록이 비어 있습니다.";
+            for (int i = 0; i < file.Monsters.Count; i++)
+            {
+                MonsterEntry m = file.Monsters[i];
+                if (!MonsterTypes.Contains(m.Type)) return $"monsters[{i}]: type '{m.Type}'은 지원하지 않습니다. 사용 가능: {string.Join(", ", MonsterTypes)}";
+                if (!(m.Weight > 0)) return $"monsters[{i}]: weight는 0보다 커야 합니다.";
+            }
+            return null;
+        }
+
+        private MonsterEntry RollMonster()
+        {
+            List<MonsterEntry> list = monsters.Monsters;
+            double total = list.Sum(m => m.Weight);
+            double pick = random.NextDouble() * total;
+            foreach (MonsterEntry m in list)
+            {
+                pick -= m.Weight;
+                if (pick < 0) return m;
+            }
+            return list[^1];
+        }
+
+        private sealed class MonsterEntry
+        {
+            public string Name   { get; set; } = "";   // 사람이 읽기 위한 이름 (로그에 표시)
+            public string Type   { get; set; } = "GreenSlime";
+            public double Weight { get; set; }
+        }
+
+        private sealed class MonstersFile
+        {
+            public List<MonsterEntry> Monsters { get; set; } = new();
+
+            private static MonsterEntry M(string name, string type, double weight) => new() { Name = name, Type = type, Weight = weight };
+
+            public static MonstersFile CreateDefault() => new()
+            {
+                Monsters = new List<MonsterEntry>
+                {
+                    M("초록 슬라임", "GreenSlime", 40), M("박쥐", "Bat", 20), M("파란 슬라임", "FrostJelly", 15),
+                    M("바위 게", "RockCrab", 10), M("빨간 슬라임", "RedSlime", 10), M("그림자 무사", "ShadowBrute", 5)
                 }
             };
         }

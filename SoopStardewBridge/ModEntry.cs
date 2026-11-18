@@ -23,22 +23,26 @@ using StardewValley.Monsters;
 namespace SoopStardewBridge
 {
     // ── 호스트 ↔ 플레이어 메시지 ───────────────────────────────────────────
-    // 보상 대기열(state.json)은 호스트(Docker 서버)에만 있다. 플레이어 게임은 창을 띄우고
-    // 자기 인벤토리에 아이템을 넣는 일만 하며, 필요한 정보는 SMAPI 멀티플레이 메시지로 주고받는다.
+    // 보상 대기열(state.json)과 아이템 목록(loot.json)은 호스트(Docker 서버)에만 있다.
+    // 플레이어 게임은 창을 띄우고 자기 인벤토리를 바꾸는 일만 하며, 필요한 정보는 SMAPI 멀티플레이 메시지로 주고받는다.
     internal sealed class PendingRequestMessage { public string Reason { get; set; } = "query"; }
-    internal sealed class PendingMessage        { public int Chests { get; set; } public string Reason { get; set; } = "query"; }
-    internal sealed class ClaimRequestMessage   { }
-    internal sealed class GrantMessage          { public int Chests { get; set; } public int Remaining { get; set; } }
-    internal sealed class ReturnMessage         { public int Chests { get; set; } }
+    internal sealed class PendingMessage        { public int Chests { get; set; } public int PremiumChests { get; set; } public string Reason { get; set; } = "query"; }
+    internal sealed class ClaimRequestMessage   { public string Kind { get; set; } = "all"; }   // chest | premiumChest | all
+    internal sealed class GrantMessage          { public int Chests { get; set; } public int PremiumChests { get; set; } public int RemainingChests { get; set; } public int RemainingPremiumChests { get; set; } }
+    internal sealed class ReturnMessage         { public int Chests { get; set; } public int PremiumChests { get; set; } }
+    internal sealed class OpenRequestMessage    { public string Kind { get; set; } = "chest"; }
+    internal sealed class OpenResultMessage     { public string Kind { get; set; } = "chest"; public string ItemId { get; set; } = ""; public int Amount { get; set; } public int Gold { get; set; } public string Error { get; set; } = ""; }
 
     // ── 보상 수령 UI (플레이어 게임에서 표시) ──────────────────────────────
     internal sealed class RewardClaimMenu : IClickableMenu
     {
-        private const int MenuWidth  = 520;
-        private const int MenuHeight = 320;
+        private const int MenuWidth  = 600;
+        private const int MenuHeight = 420;
 
         private readonly ModEntry _mod;
-        private Rectangle _claimBtn;
+        private readonly Item _normalIcon;
+        private readonly Item _premiumIcon;
+        private Rectangle _normalBtn, _premiumBtn, _allBtn;
         private ClickableTextureComponent _closeBtn = null!;
 
         public RewardClaimMenu(ModEntry mod) : base(
@@ -47,13 +51,20 @@ namespace SoopStardewBridge
             MenuWidth, MenuHeight)
         {
             _mod = mod;
+            _normalIcon  = ItemRegistry.Create(ModEntry.NormalChestId, 1);
+            _premiumIcon = ItemRegistry.Create(ModEntry.PremiumChestId, 1);
             RebuildButtons();
             Game1.playSound("shwip");
         }
 
+        private int RowY(int index) => yPositionOnScreen + 104 + index * 84;
+
         private void RebuildButtons()
         {
-            _claimBtn = new Rectangle(xPositionOnScreen + width / 2 - 120, yPositionOnScreen + height - 96, 240, 60);
+            int btnX = xPositionOnScreen + width - 64 - 140;
+            _normalBtn  = new Rectangle(btnX, RowY(0) + 2, 140, 60);
+            _premiumBtn = new Rectangle(btnX, RowY(1) + 2, 140, 60);
+            _allBtn     = new Rectangle(xPositionOnScreen + width / 2 - 130, yPositionOnScreen + height - 100, 260, 64);
             _closeBtn = new ClickableTextureComponent(
                 new Rectangle(xPositionOnScreen + width - 44, yPositionOnScreen - 4, 48, 48),
                 Game1.mouseCursors, new Rectangle(337, 494, 12, 12), 4f);
@@ -65,6 +76,27 @@ namespace SoopStardewBridge
             b.DrawString(Game1.dialogueFont, text, new Vector2(xPositionOnScreen + (width - size.X) / 2f, y), color);
         }
 
+        private void DrawButton(SpriteBatch b, Rectangle r, string label, bool enabled)
+        {
+            bool hover = enabled && r.Contains(Game1.getMouseX(), Game1.getMouseY());
+            Color tint = !enabled ? Color.Gray * 0.6f : hover ? Color.Wheat : Color.White;
+            drawTextureBox(b, Game1.mouseCursors, new Rectangle(432, 439, 9, 9), r.X, r.Y, r.Width, r.Height, tint, 4f, false);
+            Vector2 s = Game1.dialogueFont.MeasureString(label);
+            b.DrawString(Game1.dialogueFont, label, new Vector2(r.X + (r.Width - s.X) / 2f, r.Y + (r.Height - s.Y) / 2f + 4),
+                enabled ? Game1.textColor : Game1.textColor * 0.4f);
+        }
+
+        private void DrawRow(SpriteBatch b, int index, Item icon, string name, int count, Rectangle btn)
+        {
+            int y = RowY(index);
+            icon.drawInMenu(b, new Vector2(xPositionOnScreen + 40, y), 1f);
+            b.DrawString(Game1.dialogueFont, name, new Vector2(xPositionOnScreen + 120, y + 14), Game1.textColor);
+            string countText = $"{count} 개";
+            Vector2 cs = Game1.dialogueFont.MeasureString(countText);
+            b.DrawString(Game1.dialogueFont, countText, new Vector2(btn.X - 28 - cs.X, y + 14), count > 0 ? Game1.textColor : Game1.textColor * 0.45f);
+            DrawButton(b, btn, "수령", !_mod.ClientWaiting && count > 0);
+        }
+
         public override void draw(SpriteBatch b)
         {
             b.Draw(Game1.fadeToBlackRect, new Rectangle(0, 0, Game1.uiViewport.Width, Game1.uiViewport.Height), Color.Black * 0.4f);
@@ -72,33 +104,20 @@ namespace SoopStardewBridge
                 xPositionOnScreen, yPositionOnScreen, width, height, Color.White, 1f, false);
 
             DrawCentered(b, "SOOP 후원 보상", yPositionOnScreen + 28, Game1.textColor);
-            b.Draw(Game1.staminaRect, new Rectangle(xPositionOnScreen + 24, yPositionOnScreen + 80, width - 48, 2), Color.Gray * 0.5f);
+            b.Draw(Game1.staminaRect, new Rectangle(xPositionOnScreen + 24, yPositionOnScreen + 84, width - 48, 2), Color.Gray * 0.5f);
 
-            float midY = yPositionOnScreen + 120;
-            int chests = _mod.ClientPendingChests;
-
-            if (_mod.ClientWaiting)
+            if (_mod.ClientWaiting && (DateTime.UtcNow - _mod.ClientWaitingSince).TotalSeconds > 6)
             {
-                bool timedOut = (DateTime.UtcNow - _mod.ClientWaitingSince).TotalSeconds > 6;
-                DrawCentered(b, timedOut ? "서버가 응답하지 않습니다." : "보상 정보를 확인하는 중...", midY, Game1.textColor * 0.7f);
-                if (timedOut)
-                    DrawCentered(b, "서버에 모드가 설치되어 있는지 확인하세요.", midY + 44, Game1.textColor * 0.6f);
-            }
-            else if (chests <= 0)
-            {
-                DrawCentered(b, "수령할 보상이 없습니다.", midY, Game1.textColor * 0.6f);
+                DrawCentered(b, "서버가 응답하지 않습니다.", RowY(0) + 20, Game1.textColor * 0.7f);
+                DrawCentered(b, "서버에 모드가 설치되어 있는지 확인하세요.", RowY(1) + 10, Game1.textColor * 0.6f);
             }
             else
             {
-                DrawCentered(b, $"SOOP 보상 상자  ×  {chests}", midY, Game1.textColor);
-
-                bool hover = _claimBtn.Contains(Game1.getMouseX(), Game1.getMouseY());
-                drawTextureBox(b, Game1.mouseCursors, new Rectangle(432, 439, 9, 9),
-                    _claimBtn.X, _claimBtn.Y, _claimBtn.Width, _claimBtn.Height, hover ? Color.Wheat : Color.White, 4f, false);
-                Vector2 bs = Game1.dialogueFont.MeasureString("전체 수령");
-                b.DrawString(Game1.dialogueFont, "전체 수령",
-                    new Vector2(_claimBtn.X + (_claimBtn.Width - bs.X) / 2f, _claimBtn.Y + (_claimBtn.Height - bs.Y) / 2f + 4),
-                    Game1.textColor);
+                int normal  = _mod.ClientPendingChests;
+                int premium = _mod.ClientPendingPremiumChests;
+                DrawRow(b, 0, _normalIcon,  "일반 상자", normal,  _normalBtn);
+                DrawRow(b, 1, _premiumIcon, "고급 상자", premium, _premiumBtn);
+                DrawButton(b, _allBtn, "전체 수령", !_mod.ClientWaiting && normal + premium > 0);
             }
 
             _closeBtn.draw(b);
@@ -113,9 +132,11 @@ namespace SoopStardewBridge
                 exitThisMenu();
                 return;
             }
+            if (_mod.ClientWaiting) return;
 
-            if (!_mod.ClientWaiting && _mod.ClientPendingChests > 0 && _claimBtn.Contains(x, y))
-                _mod.RequestClaim();
+            if      (_normalBtn.Contains(x, y)  && _mod.ClientPendingChests > 0)        _mod.RequestClaim(ModEntry.KindNormal);
+            else if (_premiumBtn.Contains(x, y) && _mod.ClientPendingPremiumChests > 0) _mod.RequestClaim(ModEntry.KindPremium);
+            else if (_allBtn.Contains(x, y)     && _mod.ClientPendingChests + _mod.ClientPendingPremiumChests > 0) _mod.RequestClaim(ModEntry.KindAll);
         }
 
         public override void receiveKeyPress(Keys key)
@@ -138,16 +159,24 @@ namespace SoopStardewBridge
     // ── 메인 모드 ─────────────────────────────────────────────────────────────
     internal sealed class ModEntry : Mod
     {
-        private const string ChestItemId       = "SoopStardewBridge_RewardChest";
-        private const string ChestTextureAsset = "SoopStardewBridge/reward_chest";
-        private const int    ChestSpriteIndex  = 0;
-        private const int    MaxGrantPerClaim  = 999;   // 한 칸에 쌓을 수 있는 최대 개수
+        // 일반 상자는 예전 ID를 그대로 써서 이미 받은 상자도 일반 상자가 된다.
+        public const string NormalChestId  = "SoopStardewBridge_RewardChest";
+        public const string PremiumChestId = "SoopStardewBridge_PremiumChest";
+        private const string NormalTextureAsset  = "SoopStardewBridge/reward_chest";
+        private const string PremiumTextureAsset = "SoopStardewBridge/premium_chest";
+        private const int    MaxGrantPerClaim = 999;   // 한 칸에 쌓을 수 있는 최대 개수
+
+        public const string KindNormal  = "chest";
+        public const string KindPremium = "premiumChest";
+        public const string KindAll     = "all";
 
         private const string MsgPendingRequest = "PendingRequest";  // 플레이어 → 호스트
         private const string MsgPending        = "Pending";         // 호스트 → 플레이어
         private const string MsgClaimRequest   = "ClaimRequest";    // 플레이어 → 호스트
         private const string MsgGrant          = "Grant";           // 호스트 → 플레이어
         private const string MsgReturn         = "Return";          // 플레이어 → 호스트 (인벤토리에 못 넣은 개수)
+        private const string MsgOpenRequest    = "OpenRequest";     // 플레이어 → 호스트 (상자 열기)
+        private const string MsgOpenResult     = "OpenResult";      // 호스트 → 플레이어 (뽑힌 아이템)
 
         private static readonly JsonSerializerOptions JsonOptions = new()
         {
@@ -162,22 +191,29 @@ namespace SoopStardewBridge
         private readonly HttpClient                     centralHttp         = new() { Timeout = TimeSpan.FromSeconds(12) };
 
         // 호스트: 마지막으로 보낸 지급 수량. 플레이어가 돌려보내는 양은 이 값을 넘을 수 없다.
-        private readonly Dictionary<long, int> lastGrant = new();
+        private readonly Dictionary<long, (int Chests, int Premium)> lastGrant = new();
 
         // 플레이어 게임 쪽 표시용 값 (호스트가 알려준 값)
         public int      ClientPendingChests;
+        public int      ClientPendingPremiumChests;
         public bool     ClientWaiting;
         public DateTime ClientWaitingSince;
+        private bool     clientOpening;
+        private DateTime clientOpeningSince;
 
-        // config/rules는 백그라운드 타이머가 교체하고 다른 스레드가 읽으므로 volatile로 둔다.
+        // config/rules/loot는 백그라운드 타이머가 교체하고 다른 스레드가 읽으므로 volatile로 둔다.
         private volatile BridgeConfig config = new();
         private volatile RulesFile    rules  = RulesFile.CreateDefault();
+        private volatile LootFile     loot   = LootFile.CreateDefault();
+        private volatile bool         lootNeedsCheck = true;
         public  BridgeState  State  = new();
 
         private const string ConfigFileName = "config.json";
         private const string RulesFileName  = "rules.json";
+        private const string LootFileName   = "loot.json";
         private DateTime configWriteUtc;
         private DateTime rulesWriteUtc;
+        private DateTime lootWriteUtc;
         private System.Threading.Timer? hotReloadTimer;
 
         private HttpListener?            listener;
@@ -201,6 +237,8 @@ namespace SoopStardewBridge
             configWriteUtc = StampOf(ConfigFileName);
             EnsureRulesFile();
             ReloadRules(force: true);
+            EnsureLootFile();
+            ReloadLoot(force: true);
 
             Helper.Events.GameLoop.SaveLoaded             += OnSaveLoaded;
             Helper.Events.GameLoop.DayStarted             += OnDayStarted;
@@ -213,14 +251,10 @@ namespace SoopStardewBridge
             StartHttpListener();
             StartCentralPolling();
 
-            // 2초마다 config.json / rules.json 수정 여부를 확인한다. 게임 루프와 무관하게 동작한다.
+            // 2초마다 config.json / rules.json / loot.json 수정 여부를 확인한다. 게임 루프와 무관하게 동작한다.
             hotReloadTimer = new System.Threading.Timer(_ => HotReload(), null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(2));
 
             Monitor.Log("SOOP Stardew Bridge가 시작되었습니다.", LogLevel.Info);
-            Monitor.Log($"로컬 후원 수신 주소: http://127.0.0.1:{config.Port}/event", LogLevel.Info);
-            Monitor.Log(string.IsNullOrWhiteSpace(config.CentralServerUrl)
-                ? "Central 서버 미설정. config.json에 CentralServerUrl과 AgentToken을 추가하면 관리자 보상을 받을 수 있습니다."
-                : $"Central 서버 연결: {config.CentralServerUrl}", LogLevel.Info);
         }
 
         // 채팅창에 /우편함 을 입력하면 보상 창이 열린다. (/mailbox 도 같음)
@@ -249,7 +283,9 @@ namespace SoopStardewBridge
             {
                 // 플레이어 게임: 접속하면 호스트에 내 대기 보상을 물어본다 (있으면 HUD 알림).
                 ClientPendingChests = 0;
+                ClientPendingPremiumChests = 0;
                 ClientWaiting = false;
+                clientOpening = false;
                 SendToHost(MsgPendingRequest, new PendingRequestMessage { Reason = "login" });
                 return;
             }
@@ -262,7 +298,8 @@ namespace SoopStardewBridge
 
             Monitor.Log(
                 $"처리 이벤트: {State.ProcessedEventIds.Count}, " +
-                $"대기 상자 대상: {State.PendingChests.Count}, " +
+                $"대기 일반 상자 대상: {State.PendingChests.Count}, " +
+                $"대기 고급 상자 대상: {State.PendingPremiumChests.Count}, " +
                 $"대기 몬스터 대상: {State.PendingMonsters.Count}",
                 LogLevel.Info);
         }
@@ -274,6 +311,20 @@ namespace SoopStardewBridge
 
         private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
         {
+            // 아이템 목록 확인은 게임 데이터가 준비된 뒤 게임 스레드에서 한다.
+            if (lootNeedsCheck && Context.IsGameLaunched && Context.IsMainPlayer)
+            {
+                lootNeedsCheck = false;
+                CheckLootItems(loot);
+            }
+
+            // 상자를 열었는데 서버가 답하지 않으면 다시 열 수 있게 풀어 준다.
+            if (clientOpening && (DateTime.UtcNow - clientOpeningSince).TotalSeconds > 8)
+            {
+                clientOpening = false;
+                Game1.addHUDMessage(new HUDMessage("서버가 응답하지 않아 상자를 열지 못했습니다.", HUDMessage.error_type));
+            }
+
             if (!Context.IsWorldReady || !Context.IsMainPlayer) return;
 
             if (e.IsMultipleOf(60)) LogOnlineFarmers();
@@ -301,8 +352,37 @@ namespace SoopStardewBridge
             {
                 OpenClaimMenu();
                 Helper.Input.Suppress(e.Button);
+                return;
             }
+
+            if (!Context.IsPlayerFree) return;
+            bool action = e.Button.IsActionButton();
+            bool useTool = e.Button.IsUseToolButton();
+            if (!action && !useTool) return;
+
+            // 바닥에 설치된 SOOP 상자를 우클릭하면 다시 줍는다 (예전 버전에서 설치된 상자 회수용).
+            if (action && TryPickUpPlacedChest(e.Cursor.GrabTile))
+            {
+                Helper.Input.Suppress(e.Button);
+                return;
+            }
+
+            // SOOP 상자를 들고 있으면 바닥에 설치되지 않게 막고, 우클릭이면 연다.
+            string? kind = KindOf(Game1.player.CurrentItem);
+            if (kind == null) return;
+            Helper.Input.Suppress(e.Button);
+            if (action) TryOpenHeldChest(kind);
         }
+
+        public static string? KindOf(Item? item) => item?.QualifiedItemId switch
+        {
+            "(O)" + NormalChestId  => KindNormal,
+            "(O)" + PremiumChestId => KindPremium,
+            _ => null
+        };
+
+        private static string ChestIdOf(string kind) => kind == KindPremium ? PremiumChestId : NormalChestId;
+        private static string KindName(string kind) => kind == KindPremium ? "고급 상자" : "일반 상자";
 
         // ── 플레이어 게임 쪽 ─────────────────────────────────────────────────
 
@@ -317,12 +397,16 @@ namespace SoopStardewBridge
             SendToHost(MsgPendingRequest, new PendingRequestMessage { Reason = "query" });
         }
 
-        public void RequestClaim()
+        public void RequestClaim(string kind)
         {
-            if (ClientWaiting || ClientPendingChests <= 0) return;
+            if (ClientWaiting) return;
 
-            // 인벤토리가 꽉 찼으면 요청하지 않는다 (보상은 서버 대기열에 그대로 남는다).
-            if (!Game1.player.couldInventoryAcceptThisItem(ItemRegistry.Create(ChestItemId, 1)))
+            // 받으려는 종류 중 하나도 인벤토리에 못 들어가면 요청하지 않는다 (보상은 서버 대기열에 그대로 남는다).
+            var kinds = kind == KindAll ? new[] { KindNormal, KindPremium } : new[] { kind };
+            bool anyFits = kinds.Any(k =>
+                (k == KindNormal ? ClientPendingChests : ClientPendingPremiumChests) > 0 &&
+                Game1.player.couldInventoryAcceptThisItem(ItemRegistry.Create(ChestIdOf(k), 1)));
+            if (!anyFits)
             {
                 Game1.playSound("cancel");
                 Game1.addHUDMessage(new HUDMessage("인벤토리에 공간이 없습니다. 한 칸 이상 비운 뒤 다시 수령하세요.", HUDMessage.error_type));
@@ -331,102 +415,227 @@ namespace SoopStardewBridge
 
             ClientWaiting = true;
             ClientWaitingSince = DateTime.UtcNow;
-            SendToHost(MsgClaimRequest, new ClaimRequestMessage());
+            SendToHost(MsgClaimRequest, new ClaimRequestMessage { Kind = kind });
         }
 
         private void OnClientPending(PendingMessage msg)
         {
             ClientPendingChests = Math.Max(0, msg.Chests);
+            ClientPendingPremiumChests = Math.Max(0, msg.PremiumChests);
             ClientWaiting = false;
 
             // 접속 직후나 새 보상이 들어왔을 때만 알린다 (창을 열어 조회한 경우는 창에 표시됨).
-            if (msg.Reason != "query" && ClientPendingChests > 0)
-                Game1.addHUDMessage(new HUDMessage($"SOOP 보상 상자 {ClientPendingChests}개 대기 중! F5 또는 /우편함 으로 수령하세요.", HUDMessage.newQuest_type));
+            if (msg.Reason != "query" && ClientPendingChests + ClientPendingPremiumChests > 0)
+                Game1.addHUDMessage(new HUDMessage(
+                    $"SOOP 보상 대기 중: 일반 상자 {ClientPendingChests}개, 고급 상자 {ClientPendingPremiumChests}개. F5 또는 /우편함 으로 수령하세요.",
+                    HUDMessage.newQuest_type));
+        }
+
+        private int AddToInventory(string itemId, int amount)
+        {
+            if (amount <= 0) return 0;
+            Item? left = Game1.player.addItemToInventory(ItemRegistry.Create(itemId, amount));
+            return left?.Stack ?? 0;   // 못 넣은 개수
         }
 
         private void OnClientGrant(GrantMessage msg)
         {
             ClientWaiting = false;
-            int granted = Math.Max(0, msg.Chests);
-            int returned = 0;
+            int gotNormal  = Math.Max(0, msg.Chests);
+            int gotPremium = Math.Max(0, msg.PremiumChests);
 
-            if (granted > 0)
+            int backNormal  = AddToInventory(NormalChestId,  gotNormal);
+            int backPremium = AddToInventory(PremiumChestId, gotPremium);
+            if (backNormal + backPremium > 0)
+                SendToHost(MsgReturn, new ReturnMessage { Chests = backNormal, PremiumChests = backPremium });
+
+            int addedNormal  = gotNormal  - backNormal;
+            int addedPremium = gotPremium - backPremium;
+            ClientPendingChests        = Math.Max(0, msg.RemainingChests) + backNormal;
+            ClientPendingPremiumChests = Math.Max(0, msg.RemainingPremiumChests) + backPremium;
+
+            if (addedNormal + addedPremium > 0)
             {
-                Item stack = ItemRegistry.Create(ChestItemId, granted);
-                Item? left = Game1.player.addItemToInventory(stack);
-                returned = left?.Stack ?? 0;
-                if (returned > 0)
-                    SendToHost(MsgReturn, new ReturnMessage { Chests = returned });
-            }
-
-            int added = granted - returned;
-            ClientPendingChests = Math.Max(0, msg.Remaining) + returned;
-
-            if (added > 0)
-            {
+                var parts = new List<string>();
+                if (addedNormal  > 0) parts.Add($"일반 상자 {addedNormal}개");
+                if (addedPremium > 0) parts.Add($"고급 상자 {addedPremium}개");
+                string text = $"{string.Join(", ", parts)}를 받았습니다.";
+                if (backNormal + backPremium > 0) text += $" 공간이 부족해 {backNormal + backPremium}개는 대기 중입니다.";
                 Game1.playSound("coin");
-                Game1.addHUDMessage(new HUDMessage(
-                    returned > 0
-                        ? $"보상 상자 {added}개를 받았습니다. 공간이 부족해 {returned}개는 대기 중입니다."
-                        : $"보상 상자 {added}개를 받았습니다.",
-                    HUDMessage.newQuest_type));
+                Game1.addHUDMessage(new HUDMessage(text, HUDMessage.newQuest_type));
             }
             else
             {
                 Game1.playSound("cancel");
                 Game1.addHUDMessage(new HUDMessage(
-                    granted > 0 ? "인벤토리에 공간이 없습니다. 한 칸 이상 비운 뒤 다시 수령하세요." : "수령할 보상이 없습니다.",
+                    gotNormal + gotPremium > 0 ? "인벤토리에 공간이 없습니다. 한 칸 이상 비운 뒤 다시 수령하세요." : "수령할 보상이 없습니다.",
                     HUDMessage.error_type));
             }
 
-            if (ClientPendingChests <= 0 && Game1.activeClickableMenu is RewardClaimMenu menu)
+            if (ClientPendingChests + ClientPendingPremiumChests <= 0 && Game1.activeClickableMenu is RewardClaimMenu menu)
                 menu.exitThisMenu();
+        }
+
+        // 들고 있는 상자 열기: 호스트에 뽑기를 요청하고, 결과가 오면 상자 1개를 빼고 아이템을 넣는다.
+        private void TryOpenHeldChest(string kind)
+        {
+            if (clientOpening) return;
+
+            Item held = Game1.player.CurrentItem;
+            // 상자가 1개뿐이면 열면서 그 칸이 비므로 괜찮다. 여러 개면 빈 칸이 하나는 있어야 한다.
+            bool hasEmptySlot = Game1.player.Items.Take(Game1.player.MaxItems).Any(i => i == null);
+            if (held.Stack > 1 && !hasEmptySlot)
+            {
+                Game1.playSound("cancel");
+                Game1.addHUDMessage(new HUDMessage("인벤토리에 공간이 없습니다. 한 칸 이상 비운 뒤 상자를 여세요.", HUDMessage.error_type));
+                return;
+            }
+
+            clientOpening = true;
+            clientOpeningSince = DateTime.UtcNow;
+            SendToHost(MsgOpenRequest, new OpenRequestMessage { Kind = kind });
+        }
+
+        private void OnClientOpenResult(OpenResultMessage msg)
+        {
+            clientOpening = false;
+            if (!string.IsNullOrEmpty(msg.Error))
+            {
+                Game1.playSound("cancel");
+                Game1.addHUDMessage(new HUDMessage(msg.Error, HUDMessage.error_type));
+                return;
+            }
+
+            // 요청 사이에 상자를 다른 칸으로 옮겼을 수 있으므로 인벤토리에서 같은 종류 상자 1개를 찾아 뺀다.
+            string chestQid = "(O)" + ChestIdOf(msg.Kind);
+            var items = Game1.player.Items;
+            int slot = -1;
+            if (Game1.player.CurrentItem?.QualifiedItemId == chestQid) slot = Game1.player.CurrentToolIndex;
+            else for (int i = 0; i < items.Count; i++) if (items[i]?.QualifiedItemId == chestQid) { slot = i; break; }
+            if (slot < 0)
+            {
+                Game1.addHUDMessage(new HUDMessage("열 상자가 인벤토리에 없습니다.", HUDMessage.error_type));
+                return;
+            }
+            if (items[slot].Stack > 1) items[slot].Stack--; else items[slot] = null;
+
+            string got;
+            if (msg.Gold > 0)
+            {
+                Game1.player.Money += msg.Gold;
+                got = $"{msg.Gold:N0}골드";
+            }
+            else
+            {
+                Item reward = ItemRegistry.Create(msg.ItemId, Math.Max(1, msg.Amount));
+                got = $"{reward.DisplayName} {reward.Stack}개";
+                Item? left = Game1.player.addItemToInventory(reward);
+                if (left != null && left.Stack > 0)
+                {
+                    Game1.createItemDebris(left, Game1.player.getStandingPosition(), Game1.player.FacingDirection, Game1.player.currentLocation);
+                    got += " (공간이 부족해 일부는 바닥에 떨어졌습니다)";
+                }
+            }
+
+            Game1.playSound(msg.Kind == KindPremium ? "reward" : "coin");
+            Game1.addHUDMessage(new HUDMessage($"{KindName(msg.Kind)}에서 {got}을(를) 얻었습니다!", HUDMessage.newQuest_type));
+        }
+
+        // 예전 버전에서 바닥에 설치된 상자를 우클릭하면 인벤토리로 돌려준다.
+        private bool TryPickUpPlacedChest(Vector2 tile)
+        {
+            GameLocation? location = Game1.currentLocation;
+            if (location == null || !location.objects.TryGetValue(tile, out StardewValley.Object? placed)) return false;
+            string? kind = KindOf(placed);
+            if (kind == null) return false;
+            if (Vector2.Distance(tile, Game1.player.Tile) > 1.9f) return false;   // 손이 닿는 거리에서만
+
+            Item chest = ItemRegistry.Create(ChestIdOf(kind), Math.Max(1, placed.Stack));
+            if (!Game1.player.couldInventoryAcceptThisItem(chest))
+            {
+                Game1.playSound("cancel");
+                Game1.addHUDMessage(new HUDMessage("인벤토리에 공간이 없어 상자를 주울 수 없습니다.", HUDMessage.error_type));
+                return true;
+            }
+
+            location.objects.Remove(tile);
+            Game1.player.addItemToInventory(chest);
+            Game1.playSound("pickUpItem");
+            Game1.addHUDMessage(new HUDMessage($"설치된 {KindName(kind)}를 다시 주웠습니다. 들고 우클릭하면 열 수 있습니다.", HUDMessage.newQuest_type));
+            return true;
         }
 
         // ── 호스트 쪽 ────────────────────────────────────────────────────────
 
-        private void OnHostPendingRequest(long fromId, PendingRequestMessage msg)
+        private void SendPending(long farmerId, string reason)
         {
-            State.PendingChests.TryGetValue(fromId, out int chests);
-            SendToPlayer(fromId, MsgPending, new PendingMessage { Chests = chests, Reason = msg.Reason == "login" ? "login" : "query" });
+            State.PendingChests.TryGetValue(farmerId, out int normal);
+            State.PendingPremiumChests.TryGetValue(farmerId, out int premium);
+            SendToPlayer(farmerId, MsgPending, new PendingMessage { Chests = normal, PremiumChests = premium, Reason = reason });
         }
 
-        private void OnHostClaimRequest(long fromId)
-        {
-            State.PendingChests.TryGetValue(fromId, out int pending);
-            int give = Math.Min(Math.Max(0, pending), MaxGrantPerClaim);
-            int remaining = pending - give;
+        private void OnHostPendingRequest(long fromId, PendingRequestMessage msg)
+            => SendPending(fromId, msg.Reason == "login" ? "login" : "query");
 
-            if (give > 0)
+        private static int Take(Dictionary<long, int> dict, long farmerId, int max)
+        {
+            dict.TryGetValue(farmerId, out int pending);
+            int give = Math.Min(Math.Max(0, pending), max);
+            int remaining = pending - give;
+            if (remaining > 0) dict[farmerId] = remaining; else dict.Remove(farmerId);
+            return give;
+        }
+
+        private void OnHostClaimRequest(long fromId, ClaimRequestMessage msg)
+        {
+            int normal  = msg.Kind is KindNormal  or KindAll ? Take(State.PendingChests,        fromId, MaxGrantPerClaim) : 0;
+            int premium = msg.Kind is KindPremium or KindAll ? Take(State.PendingPremiumChests, fromId, MaxGrantPerClaim) : 0;
+
+            if (normal + premium > 0)
             {
-                if (remaining > 0) State.PendingChests[fromId] = remaining;
-                else State.PendingChests.Remove(fromId);
-                lastGrant[fromId] = give;
+                lastGrant[fromId] = (normal, premium);
                 SaveState();
-                Monitor.Log($"보상 상자 지급: FarmerId={fromId}, 지급={give}, 남은 대기={remaining}", LogLevel.Info);
+                Monitor.Log($"보상 상자 지급: FarmerId={fromId}, 일반={normal}, 고급={premium}", LogLevel.Info);
             }
 
-            SendToPlayer(fromId, MsgGrant, new GrantMessage { Chests = give, Remaining = Math.Max(0, remaining) });
+            State.PendingChests.TryGetValue(fromId, out int leftNormal);
+            State.PendingPremiumChests.TryGetValue(fromId, out int leftPremium);
+            SendToPlayer(fromId, MsgGrant, new GrantMessage { Chests = normal, PremiumChests = premium, RemainingChests = leftNormal, RemainingPremiumChests = leftPremium });
         }
 
         private void OnHostReturn(long fromId, ReturnMessage msg)
         {
-            lastGrant.TryGetValue(fromId, out int granted);
-            int back = Math.Min(Math.Max(0, msg.Chests), granted);   // 방금 보낸 양보다 많이 돌려받지 않는다.
+            lastGrant.TryGetValue(fromId, out var granted);
             lastGrant.Remove(fromId);
-            if (back <= 0) return;
+            // 방금 보낸 양보다 많이 돌려받지 않는다.
+            int backNormal  = Math.Min(Math.Max(0, msg.Chests),        granted.Chests);
+            int backPremium = Math.Min(Math.Max(0, msg.PremiumChests), granted.Premium);
+            if (backNormal + backPremium <= 0) return;
 
-            AddPending(State.PendingChests, fromId, back);
+            AddPending(State.PendingChests,        fromId, backNormal);
+            AddPending(State.PendingPremiumChests, fromId, backPremium);
             SaveState();
-            Monitor.Log($"보상 상자 반환(인벤토리 부족): FarmerId={fromId}, 반환={back}", LogLevel.Info);
+            Monitor.Log($"보상 상자 반환(인벤토리 부족): FarmerId={fromId}, 일반={backNormal}, 고급={backPremium}", LogLevel.Info);
+        }
+
+        private void OnHostOpenRequest(long fromId, OpenRequestMessage msg)
+        {
+            string kind = msg.Kind == KindPremium ? KindPremium : KindNormal;
+            LootEntry? entry = RollLoot(kind);
+            if (entry == null)
+            {
+                SendToPlayer(fromId, MsgOpenResult, new OpenResultMessage { Kind = kind, Error = "상자 아이템 목록(loot.json)이 비어 있거나 잘못되었습니다. 서버 로그를 확인하세요." });
+                return;
+            }
+
+            Monitor.Log($"상자 열기: FarmerId={fromId}, {KindName(kind)} → " + (entry.Gold > 0 ? $"{entry.Gold}골드" : $"{entry.ItemId} {entry.Amount}개"), LogLevel.Info);
+            SendToPlayer(fromId, MsgOpenResult, new OpenResultMessage { Kind = kind, ItemId = entry.ItemId ?? "", Amount = entry.Amount, Gold = entry.Gold });
         }
 
         // 새 상자가 대기열에 들어오면 접속 중인 해당 플레이어에게 알린다.
         private void NotifyPending(long farmerId)
         {
-            if (FindOnlineFarmer(farmerId) == null) return;
-            State.PendingChests.TryGetValue(farmerId, out int chests);
-            SendToPlayer(farmerId, MsgPending, new PendingMessage { Chests = chests, Reason = "notify" });
+            if (FindOnlineFarmer(farmerId) != null) SendPending(farmerId, "notify");
         }
 
         // ── 메시지 송수신 ────────────────────────────────────────────────────
@@ -470,6 +679,7 @@ namespace SoopStardewBridge
                         case MsgPendingRequest: HandleHostMessage(e.Type, e.FromPlayerID, e.ReadAs<PendingRequestMessage>()); break;
                         case MsgClaimRequest:   HandleHostMessage(e.Type, e.FromPlayerID, e.ReadAs<ClaimRequestMessage>());   break;
                         case MsgReturn:         HandleHostMessage(e.Type, e.FromPlayerID, e.ReadAs<ReturnMessage>());         break;
+                        case MsgOpenRequest:    HandleHostMessage(e.Type, e.FromPlayerID, e.ReadAs<OpenRequestMessage>());    break;
                     }
                 }
                 else
@@ -477,8 +687,9 @@ namespace SoopStardewBridge
                     if (e.FromPlayerID != Game1.MasterPlayer.UniqueMultiplayerID) return;   // 호스트가 보낸 것만
                     switch (e.Type)
                     {
-                        case MsgPending: HandleClientMessage(e.Type, e.ReadAs<PendingMessage>()); break;
-                        case MsgGrant:   HandleClientMessage(e.Type, e.ReadAs<GrantMessage>());   break;
+                        case MsgPending:    HandleClientMessage(e.Type, e.ReadAs<PendingMessage>());    break;
+                        case MsgGrant:      HandleClientMessage(e.Type, e.ReadAs<GrantMessage>());      break;
+                        case MsgOpenResult: HandleClientMessage(e.Type, e.ReadAs<OpenResultMessage>()); break;
                     }
                 }
             }
@@ -493,8 +704,9 @@ namespace SoopStardewBridge
             switch (message)
             {
                 case PendingRequestMessage m when type == MsgPendingRequest: OnHostPendingRequest(fromId, m); break;
-                case ClaimRequestMessage   when type == MsgClaimRequest:     OnHostClaimRequest(fromId);      break;
-                case ReturnMessage m       when type == MsgReturn:           OnHostReturn(fromId, m);         break;
+                case ClaimRequestMessage m   when type == MsgClaimRequest:   OnHostClaimRequest(fromId, m);   break;
+                case ReturnMessage m         when type == MsgReturn:         OnHostReturn(fromId, m);         break;
+                case OpenRequestMessage m    when type == MsgOpenRequest:    OnHostOpenRequest(fromId, m);    break;
             }
         }
 
@@ -502,8 +714,9 @@ namespace SoopStardewBridge
         {
             switch (message)
             {
-                case PendingMessage m when type == MsgPending: OnClientPending(m); break;
-                case GrantMessage m   when type == MsgGrant:   OnClientGrant(m);   break;
+                case PendingMessage m    when type == MsgPending:    OnClientPending(m);    break;
+                case GrantMessage m      when type == MsgGrant:      OnClientGrant(m);      break;
+                case OpenResultMessage m when type == MsgOpenResult: OnClientOpenResult(m); break;
             }
         }
 
@@ -534,6 +747,45 @@ namespace SoopStardewBridge
             }
         }
 
+        // ── 에셋: 상자 2종 등록 ─────────────────────────────────────────────
+        // Category 0 = 일반 물건. 제작 분류(-8)는 게임이 바닥 설치를 허용하므로 쓰지 않는다.
+
+        private void OnAssetRequested(object? sender, AssetRequestedEventArgs e)
+        {
+            if (e.NameWithoutLocale.IsEquivalentTo(NormalTextureAsset))
+            {
+                e.LoadFromModFile<Texture2D>("assets/reward_chest.png", AssetLoadPriority.Exclusive);
+                return;
+            }
+            if (e.NameWithoutLocale.IsEquivalentTo(PremiumTextureAsset))
+            {
+                e.LoadFromModFile<Texture2D>("assets/premium_chest.png", AssetLoadPriority.Exclusive);
+                return;
+            }
+
+            if (e.NameWithoutLocale.IsEquivalentTo("Data/Objects"))
+            {
+                e.Edit(asset =>
+                {
+                    var data = asset.AsDictionary<string, ObjectData>().Data;
+                    data[NormalChestId] = new ObjectData
+                    {
+                        Name = NormalChestId, DisplayName = "SOOP 일반 상자",
+                        Description = "SOOP 후원으로 받은 상자. 들고 우클릭하면 열립니다.",
+                        Type = "Basic", Category = 0, Price = 0,
+                        Texture = NormalTextureAsset, SpriteIndex = 0
+                    };
+                    data[PremiumChestId] = new ObjectData
+                    {
+                        Name = PremiumChestId, DisplayName = "SOOP 고급 상자",
+                        Description = "SOOP 후원으로 받은 고급 상자. 들고 우클릭하면 열립니다.",
+                        Type = "Basic", Category = 0, Price = 0,
+                        Texture = PremiumTextureAsset, SpriteIndex = 0
+                    };
+                });
+            }
+        }
+
         // ── 감사 로그 ────────────────────────────────────────────────────────
 
         private void LogOnlineFarmers()
@@ -543,36 +795,6 @@ namespace SoopStardewBridge
                 long fid = farmer.UniqueMultiplayerID;
                 if (!loggedFarmerIds.Add(fid)) continue;
                 Monitor.Log($"접속 플레이어 확인: Name={farmer.Name}, FarmerId={fid}", LogLevel.Info);
-            }
-        }
-
-        // ── 에셋 ─────────────────────────────────────────────────────────────
-
-        private void OnAssetRequested(object? sender, AssetRequestedEventArgs e)
-        {
-            if (e.NameWithoutLocale.IsEquivalentTo(ChestTextureAsset))
-            {
-                e.LoadFromModFile<Texture2D>("assets/reward_chest.png", AssetLoadPriority.Exclusive);
-                return;
-            }
-
-            if (e.NameWithoutLocale.IsEquivalentTo("Data/Objects"))
-            {
-                e.Edit(asset =>
-                {
-                    var data = asset.AsDictionary<string, ObjectData>().Data;
-                    data[ChestItemId] = new ObjectData
-                    {
-                        Name        = ChestItemId,
-                        DisplayName = "SOOP 보상 상자",
-                        Description = "SOOP 후원으로 받은 특별한 보상 상자.",
-                        Type        = "Basic",
-                        Category    = -8,
-                        Price       = 0,
-                        Texture     = ChestTextureAsset,
-                        SpriteIndex = ChestSpriteIndex
-                    };
-                });
             }
         }
 
@@ -744,6 +966,7 @@ namespace SoopStardewBridge
 
         // ── 보상 로직 ────────────────────────────────────────────────────────
 
+        // 로컬 /event 경로 (브리지에 Central 설정이 없을 때만 쓰인다).
         private void ProcessDonation(DonationEvent donation)
         {
             string eventId = donation.EventId.Trim();
@@ -760,17 +983,18 @@ namespace SoopStardewBridge
             { Monitor.Log($"FarmerId 없음 (soopId={soopId})", LogLevel.Warn); RememberEvent(eventId); return; }
 
             int balloons = donation.Balloons;
-            var (chests, monsters) = ComputeRewards(rules, balloons);   // rules.json 기준
+            var (normal, premium, monsters) = ComputeRewards(rules, balloons);   // rules.json 기준
 
-            if (chests == 0 && monsters == 0)
+            if (normal + premium + monsters == 0)
             { RememberEvent(eventId); Monitor.Log($"보상 기준 미달: {soopId}, {balloons}개", LogLevel.Info); return; }
 
-            if (chests   > 0) AddPending(State.PendingChests,   targetFarmerId.Value, chests);
-            if (monsters > 0) AddPending(State.PendingMonsters, targetFarmerId.Value, monsters);
+            AddPending(State.PendingChests,        targetFarmerId.Value, normal);
+            AddPending(State.PendingPremiumChests, targetFarmerId.Value, premium);
+            AddPending(State.PendingMonsters,      targetFarmerId.Value, monsters);
             RememberEvent(eventId);
 
-            Monitor.Log($"후원 이벤트 접수: {eventId}, {soopId}, {balloons}개 → 상자:{chests} 몬스터:{monsters}", LogLevel.Info);
-            if (chests > 0) NotifyPending(targetFarmerId.Value);
+            Monitor.Log($"후원 이벤트 접수: {eventId}, {soopId}, {balloons}개 → 일반:{normal} 고급:{premium} 몬스터:{monsters}", LogLevel.Info);
+            if (normal + premium > 0) NotifyPending(targetFarmerId.Value);
             ProcessPendingRewards();
         }
 
@@ -784,13 +1008,17 @@ namespace SoopStardewBridge
             if (fid == null || fid <= 0)
             { Monitor.Log($"Central FarmerId 없음: {job.Id}", LogLevel.Warn); return false; }
 
-            if      (job.RewardType == "chest")   AddPending(State.PendingChests,   fid.Value, job.Amount);
-            else if (job.RewardType == "monster")  AddPending(State.PendingMonsters, fid.Value, job.Amount);
-            else { Monitor.Log($"알 수 없는 보상 종류: {job.RewardType}", LogLevel.Warn); return false; }
+            switch (job.RewardType)
+            {
+                case KindNormal:  AddPending(State.PendingChests,        fid.Value, job.Amount); break;
+                case KindPremium: AddPending(State.PendingPremiumChests, fid.Value, job.Amount); break;
+                case "monster":   AddPending(State.PendingMonsters,      fid.Value, job.Amount); break;
+                default: Monitor.Log($"알 수 없는 보상 종류: {job.RewardType}", LogLevel.Warn); return false;
+            }
 
             RememberEvent(jobKey);
-            Monitor.Log($"Central 보상 접수: {job.Id}, {job.SoopId}, {job.RewardType}×{job.Amount}, FarmerId={fid}", LogLevel.Info);
-            if (job.RewardType == "chest") NotifyPending(fid.Value);
+            Monitor.Log($"Central 보상 접수: {job.Id}, {job.SoopId}, {job.RewardType} {job.Amount}개, FarmerId={fid}", LogLevel.Info);
+            if (job.RewardType is KindNormal or KindPremium) NotifyPending(fid.Value);
             ProcessPendingRewards();
             return true;
         }
@@ -830,6 +1058,7 @@ namespace SoopStardewBridge
             {
                 ReloadConfig();
                 ReloadRules(force: false);
+                ReloadLoot(force: false);
             }
             catch (Exception ex)
             {
@@ -922,7 +1151,7 @@ namespace SoopStardewBridge
                 RewardRule r = file.Rules[i];
                 string at = $"rules[{i}]";
 
-                if (r.Type != "chest" && r.Type != "monster") return $"{at}: type은 chest 또는 monster여야 합니다.";
+                if (r.Type != KindNormal && r.Type != KindPremium && r.Type != "monster") return $"{at}: type은 chest, premiumChest, monster 중 하나여야 합니다.";
                 if (r.MinBalloons   is < 1) return $"{at}: minBalloons는 1 이상이어야 합니다.";
                 if (r.MaxBalloons   is < 1) return $"{at}: maxBalloons는 1 이상이어야 합니다.";
                 if (r.ExactBalloons is < 1) return $"{at}: exactBalloons는 1 이상이어야 합니다.";
@@ -940,10 +1169,10 @@ namespace SoopStardewBridge
         }
 
         // 조건에 맞는 모든 규칙의 수량을 type별로 합산한다.
-        private static (int chests, int monsters) ComputeRewards(RulesFile file, int balloons)
+        private static (int normal, int premium, int monsters) ComputeRewards(RulesFile file, int balloons)
         {
             const int MaxAmount = 1000;
-            int chests = 0, monsters = 0;
+            int normal = 0, premium = 0, monsters = 0;
 
             foreach (RewardRule r in file.Rules)
             {
@@ -955,10 +1184,12 @@ namespace SoopStardewBridge
                 int amount = r.PerBalloons.HasValue ? balloons / r.PerBalloons.Value : (r.Amount ?? 1);
                 if (amount < 1) continue;
 
-                if (r.Type == "chest") chests += amount; else monsters += amount;
+                if (r.Type == KindNormal) normal += amount;
+                else if (r.Type == KindPremium) premium += amount;
+                else monsters += amount;
             }
 
-            return (Math.Min(chests, MaxAmount), Math.Min(monsters, MaxAmount));
+            return (Math.Min(normal, MaxAmount), Math.Min(premium, MaxAmount), Math.Min(monsters, MaxAmount));
         }
 
         private sealed class RulesFile
@@ -969,9 +1200,9 @@ namespace SoopStardewBridge
             {
                 Rules = new List<RewardRule>
                 {
-                    new() { Name = "monster-33",    Type = "monster", MinBalloons = 33, Amount = 1 },
-                    new() { Name = "chest-per-100", Type = "chest",   MinBalloons = 100, MaxBalloons = 999, PerBalloons = 100 },
-                    new() { Name = "chest-1000",    Type = "chest",   ExactBalloons = 1000, Amount = 11 }
+                    new() { Name = "normal-chest",  Type = KindNormal,  ExactBalloons = 1, Amount = 1 },
+                    new() { Name = "premium-chest", Type = KindPremium, ExactBalloons = 2, Amount = 1 },
+                    new() { Name = "monster-33",    Type = "monster",   MinBalloons = 33, Amount = 1 }
                 }
             };
         }
@@ -985,6 +1216,130 @@ namespace SoopStardewBridge
             public int?   ExactBalloons { get; set; }
             public int?   PerBalloons   { get; set; }
             public int?   Amount        { get; set; }
+        }
+
+        // ── 상자 아이템 목록 (loot.json) ─────────────────────────────────────
+        // 상자 하나를 열면 weight(확률 가중치)에 따라 항목 1개가 나온다. 파일을 고치면 2초 안에 반영된다.
+
+        private void EnsureLootFile()
+        {
+            if (File.Exists(Path.Combine(Helper.DirectoryPath, LootFileName))) return;
+            Helper.Data.WriteJsonFile(LootFileName, LootFile.CreateDefault());
+            Monitor.Log("loot.json이 없어 기본 아이템 목록으로 만들었습니다.", LogLevel.Info);
+        }
+
+        private void ReloadLoot(bool force)
+        {
+            DateTime stamp = StampOf(LootFileName);
+            if (stamp == DateTime.MinValue) return;
+            if (!force && stamp == lootWriteUtc) return;
+            lootWriteUtc = stamp;
+
+            try
+            {
+                LootFile? loaded = Helper.Data.ReadJsonFile<LootFile>(LootFileName);
+                string? error = loaded == null ? "파일이 비어 있습니다." : ValidateLoot(loaded);
+                if (error != null)
+                {
+                    Monitor.Log($"loot.json 오류, 이전 목록을 유지합니다: {error}", LogLevel.Error);
+                    return;
+                }
+
+                loot = loaded!;
+                lootNeedsCheck = true;   // 아이템 ID 확인은 게임 스레드에서
+                Monitor.Log($"상자 아이템 목록을 반영했습니다: 일반 {loaded!.Chest.Count}개, 고급 {loaded.PremiumChest.Count}개", LogLevel.Info);
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"loot.json을 읽지 못해 이전 목록을 유지합니다: {ex.Message}", LogLevel.Error);
+            }
+        }
+
+        private static string? ValidateLoot(LootFile file)
+        {
+            foreach (var (name, list) in new[] { ("chest", file.Chest), ("premiumChest", file.PremiumChest) })
+            {
+                if (list == null || list.Count == 0) return $"{name} 목록이 비어 있습니다.";
+                for (int i = 0; i < list.Count; i++)
+                {
+                    LootEntry e = list[i];
+                    string at = $"{name}[{i}]";
+                    if (!(e.Weight > 0)) return $"{at}: weight는 0보다 커야 합니다.";
+                    bool isGold = e.Gold > 0, isItem = !string.IsNullOrWhiteSpace(e.ItemId);
+                    if (isGold == isItem) return $"{at}: itemId와 gold 중 하나만 적어야 합니다.";
+                    if (isItem && (e.Amount < 1 || e.Amount > 999)) return $"{at}: amount는 1~999여야 합니다.";
+                    if (e.Gold < 0) return $"{at}: gold는 0 이상이어야 합니다.";
+                }
+            }
+            return null;
+        }
+
+        // 게임에 없는 아이템 ID를 로그로 알려 준다 (뽑기에서는 자동으로 빠진다).
+        private void CheckLootItems(LootFile file)
+        {
+            foreach (var (name, list) in new[] { ("일반", file.Chest), ("고급", file.PremiumChest) })
+            {
+                double total = list.Sum(e => e.Weight);
+                var bad = list.Where(e => e.Gold <= 0 && !ItemRegistry.Exists(e.ItemId)).ToList();
+                foreach (var e in bad)
+                    Monitor.Log($"loot.json {name} 상자: 게임에 없는 아이템 ID '{e.ItemId}'는 뽑기에서 뺍니다.", LogLevel.Warn);
+                if (bad.Count == 0)
+                    Monitor.Log($"loot.json {name} 상자 아이템 {list.Count}개 확인 완료 (가중치 합 {total:0.##})", LogLevel.Info);
+            }
+        }
+
+        private LootEntry? RollLoot(string kind)
+        {
+            LootFile file = loot;
+            var candidates = (kind == KindPremium ? file.PremiumChest : file.Chest)
+                .Where(e => e.Weight > 0 && (e.Gold > 0 || ItemRegistry.Exists(e.ItemId)))
+                .ToList();
+            double total = candidates.Sum(e => e.Weight);
+            if (candidates.Count == 0 || total <= 0) return null;
+
+            double pick = random.NextDouble() * total;
+            foreach (LootEntry e in candidates)
+            {
+                pick -= e.Weight;
+                if (pick < 0) return e;
+            }
+            return candidates[^1];
+        }
+
+        private sealed class LootEntry
+        {
+            public string  Name   { get; set; } = "";   // 사람이 읽기 위한 이름 (게임 표시에는 쓰지 않음)
+            public string? ItemId { get; set; }
+            public int     Amount { get; set; } = 1;
+            public int     Gold   { get; set; }
+            public double  Weight { get; set; }
+        }
+
+        private sealed class LootFile
+        {
+            public List<LootEntry> Chest        { get; set; } = new();
+            public List<LootEntry> PremiumChest { get; set; } = new();
+
+            private static LootEntry I(string name, string id, int amount, double weight) => new() { Name = name, ItemId = id, Amount = amount, Weight = weight };
+            private static LootEntry G(int gold, double weight) => new() { Name = $"{gold}골드", Gold = gold, Weight = weight };
+
+            public static LootFile CreateDefault() => new()
+            {
+                Chest = new List<LootEntry>
+                {
+                    I("나무", "(O)388", 15, 20), I("돌", "(O)390", 15, 20), I("섬유", "(O)771", 10, 10),
+                    I("석탄", "(O)382", 3, 10), I("구리 광석", "(O)378", 5, 10), I("철 광석", "(O)380", 3, 7),
+                    I("수액", "(O)92", 10, 6), I("커피", "(O)395", 1, 5), I("기본 비료", "(O)368", 5, 5),
+                    I("정동석", "(O)535", 1, 4), I("금 광석", "(O)384", 2, 2), G(500, 1)
+                },
+                PremiumChest = new List<LootEntry>
+                {
+                    I("철 주괴", "(O)335", 3, 18), I("단단한 나무", "(O)709", 5, 15), I("고급 비료", "(O)369", 5, 12),
+                    I("스피드-그로", "(O)465", 5, 12), I("얼어붙은 정동석", "(O)536", 2, 10), I("금 주괴", "(O)336", 2, 10),
+                    I("마그마 정동석", "(O)537", 2, 8), I("고급 스프링클러", "(O)621", 1, 6), I("오색 정동석", "(O)749", 1, 4),
+                    I("이리듐 광석", "(O)386", 3, 3), I("다이아몬드", "(O)72", 1, 1.5), I("프리즘 조각", "(O)74", 1, 0.5)
+                }
+            };
         }
 
         // ── 데이터 클래스 ────────────────────────────────────────────────────
@@ -1027,9 +1382,10 @@ namespace SoopStardewBridge
 
         public sealed class BridgeState
         {
-            public List<string>          ProcessedEventIds { get; set; } = new();
-            public Dictionary<long, int> PendingChests     { get; set; } = new();
-            public Dictionary<long, int> PendingMonsters   { get; set; } = new();
+            public List<string>          ProcessedEventIds    { get; set; } = new();
+            public Dictionary<long, int> PendingChests        { get; set; } = new();   // 일반 상자
+            public Dictionary<long, int> PendingPremiumChests { get; set; } = new();   // 고급 상자
+            public Dictionary<long, int> PendingMonsters      { get; set; } = new();
         }
     }
 }

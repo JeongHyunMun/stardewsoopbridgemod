@@ -22,126 +22,82 @@ using StardewValley.Monsters;
 
 namespace SoopStardewBridge
 {
-    // ── 보상 수령 UI ──────────────────────────────────────────────────────────
+    // ── 호스트 ↔ 플레이어 메시지 ───────────────────────────────────────────
+    // 보상 대기열(state.json)은 호스트(Docker 서버)에만 있다. 플레이어 게임은 창을 띄우고
+    // 자기 인벤토리에 아이템을 넣는 일만 하며, 필요한 정보는 SMAPI 멀티플레이 메시지로 주고받는다.
+    internal sealed class PendingRequestMessage { public string Reason { get; set; } = "query"; }
+    internal sealed class PendingMessage        { public int Chests { get; set; } public string Reason { get; set; } = "query"; }
+    internal sealed class ClaimRequestMessage   { }
+    internal sealed class GrantMessage          { public int Chests { get; set; } public int Remaining { get; set; } }
+    internal sealed class ReturnMessage         { public int Chests { get; set; } }
+
+    // ── 보상 수령 UI (플레이어 게임에서 표시) ──────────────────────────────
     internal sealed class RewardClaimMenu : IClickableMenu
     {
-        private const int MenuWidth  = 500;
-        private const int MenuHeight = 340;
+        private const int MenuWidth  = 520;
+        private const int MenuHeight = 320;
 
         private readonly ModEntry _mod;
-        private readonly long     _farmerId;
-
-        private ClickableTextureComponent _claimBtn = null!;
+        private Rectangle _claimBtn;
         private ClickableTextureComponent _closeBtn = null!;
 
-        public RewardClaimMenu(ModEntry mod, Farmer farmer) : base(
+        public RewardClaimMenu(ModEntry mod) : base(
             (Game1.uiViewport.Width  - MenuWidth)  / 2,
             (Game1.uiViewport.Height - MenuHeight) / 2,
-            MenuWidth, MenuHeight, showUpperRightCloseButton: true)
+            MenuWidth, MenuHeight)
         {
-            _mod      = mod;
-            _farmerId = farmer.UniqueMultiplayerID;
+            _mod = mod;
             RebuildButtons();
             Game1.playSound("shwip");
         }
 
         private void RebuildButtons()
         {
-            int cx = xPositionOnScreen + width  / 2;
-            int by = yPositionOnScreen + height - 90;
-
-            _claimBtn = new ClickableTextureComponent(
-                new Rectangle(cx - 120, by, 240, 60),
-                Game1.mouseCursors,
-                new Rectangle(128, 256, 64, 20), 3f)
-            { myID = 100 };
-
+            _claimBtn = new Rectangle(xPositionOnScreen + width / 2 - 120, yPositionOnScreen + height - 96, 240, 60);
             _closeBtn = new ClickableTextureComponent(
                 new Rectangle(xPositionOnScreen + width - 44, yPositionOnScreen - 4, 48, 48),
-                Game1.mouseCursors,
-                new Rectangle(337, 494, 12, 12), 4f)
-            { myID = 101 };
-
-            populateClickableComponentList();
+                Game1.mouseCursors, new Rectangle(337, 494, 12, 12), 4f);
         }
 
-        private (int chests, int monsters) GetPending()
+        private void DrawCentered(SpriteBatch b, string text, float y, Color color)
         {
-            _mod.State.PendingChests  .TryGetValue(_farmerId, out int c);
-            _mod.State.PendingMonsters.TryGetValue(_farmerId, out int m);
-            return (c, m);
+            Vector2 size = Game1.dialogueFont.MeasureString(text);
+            b.DrawString(Game1.dialogueFont, text, new Vector2(xPositionOnScreen + (width - size.X) / 2f, y), color);
         }
 
         public override void draw(SpriteBatch b)
         {
-            b.Draw(Game1.fadeToBlackRect,
-                new Rectangle(0, 0, Game1.uiViewport.Width, Game1.uiViewport.Height),
-                Color.Black * 0.4f);
-
+            b.Draw(Game1.fadeToBlackRect, new Rectangle(0, 0, Game1.uiViewport.Width, Game1.uiViewport.Height), Color.Black * 0.4f);
             drawTextureBox(b, Game1.menuTexture, new Rectangle(0, 256, 60, 60),
                 xPositionOnScreen, yPositionOnScreen, width, height, Color.White, 1f, false);
 
-            string title = "SOOP 후원 보상";
-            Vector2 ts = Game1.dialogueFont.MeasureString(title);
-            b.DrawString(Game1.dialogueFont, title,
-                new Vector2(xPositionOnScreen + (width - ts.X) / 2f, yPositionOnScreen + 24),
-                Game1.textColor);
+            DrawCentered(b, "SOOP 후원 보상", yPositionOnScreen + 28, Game1.textColor);
+            b.Draw(Game1.staminaRect, new Rectangle(xPositionOnScreen + 24, yPositionOnScreen + 80, width - 48, 2), Color.Gray * 0.5f);
 
-            b.Draw(Game1.staminaRect,
-                new Rectangle(xPositionOnScreen + 24, yPositionOnScreen + 72, width - 48, 2),
-                Color.Gray * 0.5f);
+            float midY = yPositionOnScreen + 120;
+            int chests = _mod.ClientPendingChests;
 
-            var (chests, monsters) = GetPending();
-
-            if (chests == 0 && monsters == 0)
+            if (_mod.ClientWaiting)
             {
-                string empty = "수령할 보상이 없습니다.";
-                Vector2 es = Game1.dialogueFont.MeasureString(empty);
-                b.DrawString(Game1.dialogueFont, empty,
-                    new Vector2(xPositionOnScreen + (width - es.X) / 2f,
-                                yPositionOnScreen + height / 2f - es.Y / 2f),
-                    Game1.textColor * 0.6f);
+                bool timedOut = (DateTime.UtcNow - _mod.ClientWaitingSince).TotalSeconds > 6;
+                DrawCentered(b, timedOut ? "서버가 응답하지 않습니다." : "보상 정보를 확인하는 중...", midY, Game1.textColor * 0.7f);
+                if (timedOut)
+                    DrawCentered(b, "서버에 모드가 설치되어 있는지 확인하세요.", midY + 44, Game1.textColor * 0.6f);
+            }
+            else if (chests <= 0)
+            {
+                DrawCentered(b, "수령할 보상이 없습니다.", midY, Game1.textColor * 0.6f);
             }
             else
             {
-                int y  = yPositionOnScreen + 100;
-                int lh = 48;
+                DrawCentered(b, $"SOOP 보상 상자  ×  {chests}", midY, Game1.textColor);
 
-                if (chests > 0)
-                {
-                    b.Draw(Game1.objectSpriteSheet,
-                        new Rectangle(xPositionOnScreen + 40, y, 40, 40),
-                        Game1.getSourceRectForStandardTileSheet(Game1.objectSpriteSheet, 220, 16, 16),
-                        Color.White);
-                    b.DrawString(Game1.dialogueFont,
-                        $"SOOP 보상 상자  ×  {chests}",
-                        new Vector2(xPositionOnScreen + 92, y + 4),
-                        Game1.textColor);
-                    y += lh;
-                }
-
-                if (monsters > 0)
-                {
-                    b.Draw(Game1.mouseCursors,
-                        new Rectangle(xPositionOnScreen + 40, y, 36, 36),
-                        new Rectangle(16, 592, 16, 16), Color.White);
-                    b.DrawString(Game1.dialogueFont,
-                        $"몬스터 소환  ×  {monsters}",
-                        new Vector2(xPositionOnScreen + 92, y + 4),
-                        new Color(220, 80, 80));
-                }
-
-                // 수령 버튼
-                IClickableMenu.drawTextureBox(b,
-                    _claimBtn.bounds.X - 4, _claimBtn.bounds.Y - 4,
-                    _claimBtn.bounds.Width + 8, _claimBtn.bounds.Height + 8,
-                    Color.White);
-                string btnLabel = "전체 수령";
-                Vector2 bs = Game1.dialogueFont.MeasureString(btnLabel);
-                b.DrawString(Game1.dialogueFont, btnLabel,
-                    new Vector2(
-                        _claimBtn.bounds.X + (_claimBtn.bounds.Width  - bs.X) / 2f,
-                        _claimBtn.bounds.Y + (_claimBtn.bounds.Height - bs.Y) / 2f),
+                bool hover = _claimBtn.Contains(Game1.getMouseX(), Game1.getMouseY());
+                drawTextureBox(b, Game1.mouseCursors, new Rectangle(432, 439, 9, 9),
+                    _claimBtn.X, _claimBtn.Y, _claimBtn.Width, _claimBtn.Height, hover ? Color.Wheat : Color.White, 4f, false);
+                Vector2 bs = Game1.dialogueFont.MeasureString("전체 수령");
+                b.DrawString(Game1.dialogueFont, "전체 수령",
+                    new Vector2(_claimBtn.X + (_claimBtn.Width - bs.X) / 2f, _claimBtn.Y + (_claimBtn.Height - bs.Y) / 2f + 4),
                     Game1.textColor);
             }
 
@@ -158,23 +114,13 @@ namespace SoopStardewBridge
                 return;
             }
 
-            var (chests, monsters) = GetPending();
-            if (chests == 0 && monsters == 0) return;
-
-            if (_claimBtn.containsPoint(x, y))
-            {
-                bool claimed = _mod.ClaimRewardsForFarmer(_farmerId);
-                if (claimed) Game1.playSound("coin");
-
-                var (c2, m2) = GetPending();
-                if (c2 == 0 && m2 == 0)
-                    exitThisMenu();
-            }
+            if (!_mod.ClientWaiting && _mod.ClientPendingChests > 0 && _claimBtn.Contains(x, y))
+                _mod.RequestClaim();
         }
 
         public override void receiveKeyPress(Keys key)
         {
-            if (key == Keys.Escape || key == Keys.E)
+            if (key == Keys.Escape || Game1.options.doesInputListContain(Game1.options.menuButton, key))
             {
                 Game1.playSound("bigDeSelect");
                 exitThisMenu();
@@ -195,6 +141,13 @@ namespace SoopStardewBridge
         private const string ChestItemId       = "SoopStardewBridge_RewardChest";
         private const string ChestTextureAsset = "SoopStardewBridge/reward_chest";
         private const int    ChestSpriteIndex  = 0;
+        private const int    MaxGrantPerClaim  = 999;   // 한 칸에 쌓을 수 있는 최대 개수
+
+        private const string MsgPendingRequest = "PendingRequest";  // 플레이어 → 호스트
+        private const string MsgPending        = "Pending";         // 호스트 → 플레이어
+        private const string MsgClaimRequest   = "ClaimRequest";    // 플레이어 → 호스트
+        private const string MsgGrant          = "Grant";           // 호스트 → 플레이어
+        private const string MsgReturn         = "Return";          // 플레이어 → 호스트 (인벤토리에 못 넣은 개수)
 
         private static readonly JsonSerializerOptions JsonOptions = new()
         {
@@ -207,6 +160,14 @@ namespace SoopStardewBridge
         private readonly HashSet<long>                  loggedFarmerIds     = new();
         private readonly Random                         random              = new();
         private readonly HttpClient                     centralHttp         = new() { Timeout = TimeSpan.FromSeconds(12) };
+
+        // 호스트: 마지막으로 보낸 지급 수량. 플레이어가 돌려보내는 양은 이 값을 넘을 수 없다.
+        private readonly Dictionary<long, int> lastGrant = new();
+
+        // 플레이어 게임 쪽 표시용 값 (호스트가 알려준 값)
+        public int      ClientPendingChests;
+        public bool     ClientWaiting;
+        public DateTime ClientWaitingSince;
 
         // config/rules는 백그라운드 타이머가 교체하고 다른 스레드가 읽으므로 volatile로 둔다.
         private volatile BridgeConfig config = new();
@@ -241,12 +202,14 @@ namespace SoopStardewBridge
             EnsureRulesFile();
             ReloadRules(force: true);
 
-            Helper.Events.GameLoop.SaveLoaded    += OnSaveLoaded;
-            Helper.Events.GameLoop.DayStarted    += OnDayStarted;
-            Helper.Events.GameLoop.UpdateTicked  += OnUpdateTicked;
-            Helper.Events.Input.ButtonPressed    += OnButtonPressed;
-            Helper.Events.Content.AssetRequested += OnAssetRequested;
+            Helper.Events.GameLoop.SaveLoaded             += OnSaveLoaded;
+            Helper.Events.GameLoop.DayStarted             += OnDayStarted;
+            Helper.Events.GameLoop.UpdateTicked           += OnUpdateTicked;
+            Helper.Events.Input.ButtonPressed             += OnButtonPressed;
+            Helper.Events.Content.AssetRequested          += OnAssetRequested;
+            Helper.Events.Multiplayer.ModMessageReceived  += OnModMessageReceived;
 
+            RegisterChatCommand();
             StartHttpListener();
             StartCentralPolling();
 
@@ -260,10 +223,37 @@ namespace SoopStardewBridge
                 : $"Central 서버 연결: {config.CentralServerUrl}", LogLevel.Info);
         }
 
+        // 채팅창에 /우편함 을 입력하면 보상 창이 열린다. (/mailbox 도 같음)
+        private void RegisterChatCommand()
+        {
+            try
+            {
+                ChatCommands.Register(
+                    ModManifest.UniqueID + "_mailbox",
+                    (command, chat) => OpenClaimMenu(),
+                    name => "SOOP 후원 보상 수령 창을 엽니다.",
+                    aliases: new[] { "우편함", "mailbox" });
+                Monitor.Log("채팅 명령어 등록: /우편함, /mailbox", LogLevel.Info);
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"채팅 명령어 등록 실패 (F5는 사용 가능): {ex.Message}", LogLevel.Warn);
+            }
+        }
+
         // ── 이벤트 핸들러 ────────────────────────────────────────────────────
 
         private void OnSaveLoaded(object? sender, SaveLoadedEventArgs e)
         {
+            if (!Context.IsMainPlayer)
+            {
+                // 플레이어 게임: 접속하면 호스트에 내 대기 보상을 물어본다 (있으면 HUD 알림).
+                ClientPendingChests = 0;
+                ClientWaiting = false;
+                SendToHost(MsgPendingRequest, new PendingRequestMessage { Reason = "login" });
+                return;
+            }
+
             State = Helper.Data.ReadJsonFile<BridgeState>("state.json") ?? State;
             loggedFarmerIds.Clear();
             SaveState();
@@ -278,11 +268,13 @@ namespace SoopStardewBridge
         }
 
         private void OnDayStarted(object? sender, DayStartedEventArgs e)
-            => ProcessPendingRewards();
+        {
+            if (Context.IsMainPlayer) ProcessPendingRewards();
+        }
 
         private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
         {
-            if (!Context.IsWorldReady) return;
+            if (!Context.IsWorldReady || !Context.IsMainPlayer) return;
 
             if (e.IsMultipleOf(60)) LogOnlineFarmers();
 
@@ -304,156 +296,223 @@ namespace SoopStardewBridge
 
         private void OnButtonPressed(object? sender, ButtonPressedEventArgs e)
         {
-            if (!Context.IsWorldReady) return;
-
-            Farmer farmer = Game1.player;
-
             // F5: 보상 수령 창 열기
-            if (e.Button == SButton.F5 && Game1.activeClickableMenu == null)
+            if (e.Button == SButton.F5 && Context.IsPlayerFree)
             {
-                OpenClaimMenu(farmer);
+                OpenClaimMenu();
+                Helper.Input.Suppress(e.Button);
+            }
+        }
+
+        // ── 플레이어 게임 쪽 ─────────────────────────────────────────────────
+
+        private void OpenClaimMenu()
+        {
+            if (!Context.IsWorldReady) return;
+            if (Game1.activeClickableMenu is RewardClaimMenu) return;
+
+            ClientWaiting = true;
+            ClientWaitingSince = DateTime.UtcNow;
+            Game1.activeClickableMenu = new RewardClaimMenu(this);
+            SendToHost(MsgPendingRequest, new PendingRequestMessage { Reason = "query" });
+        }
+
+        public void RequestClaim()
+        {
+            if (ClientWaiting || ClientPendingChests <= 0) return;
+
+            // 인벤토리가 꽉 찼으면 요청하지 않는다 (보상은 서버 대기열에 그대로 남는다).
+            if (!Game1.player.couldInventoryAcceptThisItem(ItemRegistry.Create(ChestItemId, 1)))
+            {
+                Game1.playSound("cancel");
+                Game1.addHUDMessage(new HUDMessage("인벤토리에 공간이 없습니다. 한 칸 이상 비운 뒤 다시 수령하세요.", HUDMessage.error_type));
                 return;
             }
 
-            // 우편함 앞 상호작용: 보상 있으면 수령 창 먼저 띄움
-            if ((e.Button == SButton.MouseLeft || e.Button == SButton.ControllerA) &&
-                Game1.activeClickableMenu == null &&
-                farmer.currentLocation?.Name == "FarmHouse")
+            ClientWaiting = true;
+            ClientWaitingSince = DateTime.UtcNow;
+            SendToHost(MsgClaimRequest, new ClaimRequestMessage());
+        }
+
+        private void OnClientPending(PendingMessage msg)
+        {
+            ClientPendingChests = Math.Max(0, msg.Chests);
+            ClientWaiting = false;
+
+            // 접속 직후나 새 보상이 들어왔을 때만 알린다 (창을 열어 조회한 경우는 창에 표시됨).
+            if (msg.Reason != "query" && ClientPendingChests > 0)
+                Game1.addHUDMessage(new HUDMessage($"SOOP 보상 상자 {ClientPendingChests}개 대기 중! F5 또는 /우편함 으로 수령하세요.", HUDMessage.newQuest_type));
+        }
+
+        private void OnClientGrant(GrantMessage msg)
+        {
+            ClientWaiting = false;
+            int granted = Math.Max(0, msg.Chests);
+            int returned = 0;
+
+            if (granted > 0)
             {
-                Vector2 tile = farmer.Tile;
-                // 우편함 타일은 세이브마다 다를 수 있으므로 편지통 오브젝트 감지
-                foreach (var obj in farmer.currentLocation.objects.Values)
-                {
-                    if (obj.Name == "Mailbox" && Vector2.Distance(obj.TileLocation, tile) <= 1.5f)
-                    {
-                        var (c, m) = GetPendingForFarmer(farmer.UniqueMultiplayerID);
-                        if (c > 0 || m > 0)
-                        {
-                            OpenClaimMenu(farmer);
-                            Helper.Input.Suppress(e.Button);
-                        }
-                        break;
-                    }
-                }
+                Item stack = ItemRegistry.Create(ChestItemId, granted);
+                Item? left = Game1.player.addItemToInventory(stack);
+                returned = left?.Stack ?? 0;
+                if (returned > 0)
+                    SendToHost(MsgReturn, new ReturnMessage { Chests = returned });
             }
 
-            // F6 테스트: 상자 1개 추가
-            if (e.Button == SButton.F6)
+            int added = granted - returned;
+            ClientPendingChests = Math.Max(0, msg.Remaining) + returned;
+
+            if (added > 0)
             {
-                AddPending(State.PendingChests, farmer.UniqueMultiplayerID, 1);
+                Game1.playSound("coin");
+                Game1.addHUDMessage(new HUDMessage(
+                    returned > 0
+                        ? $"보상 상자 {added}개를 받았습니다. 공간이 부족해 {returned}개는 대기 중입니다."
+                        : $"보상 상자 {added}개를 받았습니다.",
+                    HUDMessage.newQuest_type));
+            }
+            else
+            {
+                Game1.playSound("cancel");
+                Game1.addHUDMessage(new HUDMessage(
+                    granted > 0 ? "인벤토리에 공간이 없습니다. 한 칸 이상 비운 뒤 다시 수령하세요." : "수령할 보상이 없습니다.",
+                    HUDMessage.error_type));
+            }
+
+            if (ClientPendingChests <= 0 && Game1.activeClickableMenu is RewardClaimMenu menu)
+                menu.exitThisMenu();
+        }
+
+        // ── 호스트 쪽 ────────────────────────────────────────────────────────
+
+        private void OnHostPendingRequest(long fromId, PendingRequestMessage msg)
+        {
+            State.PendingChests.TryGetValue(fromId, out int chests);
+            SendToPlayer(fromId, MsgPending, new PendingMessage { Chests = chests, Reason = msg.Reason == "login" ? "login" : "query" });
+        }
+
+        private void OnHostClaimRequest(long fromId)
+        {
+            State.PendingChests.TryGetValue(fromId, out int pending);
+            int give = Math.Min(Math.Max(0, pending), MaxGrantPerClaim);
+            int remaining = pending - give;
+
+            if (give > 0)
+            {
+                if (remaining > 0) State.PendingChests[fromId] = remaining;
+                else State.PendingChests.Remove(fromId);
+                lastGrant[fromId] = give;
                 SaveState();
-                Monitor.Log($"[F6 테스트] {farmer.Name}에게 보상 상자 1개 추가", LogLevel.Info);
-                Game1.addHUDMessage(new HUDMessage("테스트: 보상 상자 1개 대기 추가 (F5로 수령)", HUDMessage.newQuest_type));
+                Monitor.Log($"보상 상자 지급: FarmerId={fromId}, 지급={give}, 남은 대기={remaining}", LogLevel.Info);
             }
+
+            SendToPlayer(fromId, MsgGrant, new GrantMessage { Chests = give, Remaining = Math.Max(0, remaining) });
         }
 
-        private void OpenClaimMenu(Farmer farmer)
+        private void OnHostReturn(long fromId, ReturnMessage msg)
         {
-            var (c, m) = GetPendingForFarmer(farmer.UniqueMultiplayerID);
-            if (c == 0 && m == 0)
+            lastGrant.TryGetValue(fromId, out int granted);
+            int back = Math.Min(Math.Max(0, msg.Chests), granted);   // 방금 보낸 양보다 많이 돌려받지 않는다.
+            lastGrant.Remove(fromId);
+            if (back <= 0) return;
+
+            AddPending(State.PendingChests, fromId, back);
+            SaveState();
+            Monitor.Log($"보상 상자 반환(인벤토리 부족): FarmerId={fromId}, 반환={back}", LogLevel.Info);
+        }
+
+        // 새 상자가 대기열에 들어오면 접속 중인 해당 플레이어에게 알린다.
+        private void NotifyPending(long farmerId)
+        {
+            if (FindOnlineFarmer(farmerId) == null) return;
+            State.PendingChests.TryGetValue(farmerId, out int chests);
+            SendToPlayer(farmerId, MsgPending, new PendingMessage { Chests = chests, Reason = "notify" });
+        }
+
+        // ── 메시지 송수신 ────────────────────────────────────────────────────
+
+        private void SendToHost<T>(string type, T message) where T : notnull
+        {
+            if (Context.IsMainPlayer)
             {
-                Game1.addHUDMessage(new HUDMessage("수령할 보상이 없습니다.", HUDMessage.error_type));
+                // 호스트가 직접 플레이하는 경우 (전용 서버가 아닐 때)
+                HandleHostMessage(type, Game1.player.UniqueMultiplayerID, message);
                 return;
             }
-            Game1.activeClickableMenu = new RewardClaimMenu(this, farmer);
+            Helper.Multiplayer.SendMessage(message, type,
+                modIDs: new[] { ModManifest.UniqueID },
+                playerIDs: new[] { Game1.MasterPlayer.UniqueMultiplayerID });
         }
 
-        private (int chests, int monsters) GetPendingForFarmer(long farmerId)
+        private void SendToPlayer<T>(long farmerId, string type, T message) where T : notnull
         {
-            State.PendingChests  .TryGetValue(farmerId, out int c);
-            State.PendingMonsters.TryGetValue(farmerId, out int m);
-            return (c, m);
-        }
-
-        // ── 보상 수령 (메뉴에서 호출) ────────────────────────────────────────
-        // 반환값: true = 일부라도 지급됨, false = 인벤토리 꽉 차서 아무것도 못 줌
-
-        public bool ClaimRewardsForFarmer(long farmerId)
-        {
-            Farmer? farmer = FindOnlineFarmer(farmerId);
-            if (farmer == null) return false;
-
-            bool anyGiven = false;
-
-            // 상자 지급
-            if (State.PendingChests.TryGetValue(farmerId, out int chests) && chests > 0)
+            if (farmerId == Game1.player.UniqueMultiplayerID)
             {
-                // 인벤토리 여유 확인
-                int freeSlots = farmer.MaxItems - farmer.Items.Where(i => i != null).Count();
+                HandleClientMessage(type, message);
+                return;
+            }
+            Helper.Multiplayer.SendMessage(message, type,
+                modIDs: new[] { ModManifest.UniqueID },
+                playerIDs: new[] { farmerId });
+        }
 
-                if (freeSlots <= 0)
+        private void OnModMessageReceived(object? sender, ModMessageReceivedEventArgs e)
+        {
+            if (e.FromModID != ModManifest.UniqueID) return;
+
+            try
+            {
+                if (Context.IsMainPlayer)
                 {
-                    Game1.addHUDMessage(new HUDMessage(
-                        "인벤토리가 꽉 찼습니다. 공간을 확보한 뒤 다시 수령하세요.",
-                        HUDMessage.error_type));
-                    Monitor.Log($"보상 상자 수령 실패: 인벤토리 꽉 참 (FarmerId={farmerId}, 대기={chests})", LogLevel.Warn);
-                    // 상자는 지급 안 하고 그대로 대기 유지
+                    if (FindOnlineFarmer(e.FromPlayerID) == null) return;   // 접속 중인 플레이어만
+                    switch (e.Type)
+                    {
+                        case MsgPendingRequest: HandleHostMessage(e.Type, e.FromPlayerID, e.ReadAs<PendingRequestMessage>()); break;
+                        case MsgClaimRequest:   HandleHostMessage(e.Type, e.FromPlayerID, e.ReadAs<ClaimRequestMessage>());   break;
+                        case MsgReturn:         HandleHostMessage(e.Type, e.FromPlayerID, e.ReadAs<ReturnMessage>());         break;
+                    }
                 }
                 else
                 {
-                    int canGive  = Math.Min(chests, freeSlots);
-                    int leftover = chests - canGive;
-
-                    for (int i = 0; i < canGive; i++)
+                    if (e.FromPlayerID != Game1.MasterPlayer.UniqueMultiplayerID) return;   // 호스트가 보낸 것만
+                    switch (e.Type)
                     {
-                        var item = ItemRegistry.Create(ChestItemId, 1);
-                        farmer.addItemToInventoryBool(item);
+                        case MsgPending: HandleClientMessage(e.Type, e.ReadAs<PendingMessage>()); break;
+                        case MsgGrant:   HandleClientMessage(e.Type, e.ReadAs<GrantMessage>());   break;
                     }
-
-                    if (leftover > 0)
-                    {
-                        State.PendingChests[farmerId] = leftover;
-                        Game1.addHUDMessage(new HUDMessage(
-                            $"상자 {canGive}개 지급. 인벤토리 부족으로 {leftover}개는 대기 중입니다.",
-                            HUDMessage.newQuest_type));
-                    }
-                    else
-                    {
-                        State.PendingChests.Remove(farmerId);
-                    }
-
-                    Monitor.Log($"보상 상자 수령: FarmerId={farmerId}, 지급={canGive}, 잔여={leftover}", LogLevel.Info);
-                    anyGiven = true;
                 }
             }
-
-            // 몬스터 소환
-            if (State.PendingMonsters.TryGetValue(farmerId, out int monsters) && monsters > 0)
+            catch (Exception ex)
             {
-                for (int i = 0; i < monsters; i++)
-                {
-                    Vector2 tile  = farmer.Tile;
-                    Vector2 spawn = new(tile.X + random.Next(-3, 4), tile.Y + random.Next(-3, 4));
-                    farmer.currentLocation.characters.Add(new GreenSlime(spawn * 64f));
-                }
-                State.PendingMonsters.Remove(farmerId);
-                Monitor.Log($"몬스터 소환 완료: FarmerId={farmerId}, 수량={monsters}", LogLevel.Info);
-                anyGiven = true;
+                Monitor.Log($"모드 메시지 처리 오류 ({e.Type}): {ex.Message}", LogLevel.Warn);
             }
-
-            SaveState();
-            return anyGiven;
         }
 
-        // ── 자동 처리 (접속 중 플레이어에게 보상 대기 알림) ─────────────────
+        private void HandleHostMessage(string type, long fromId, object message)
+        {
+            switch (message)
+            {
+                case PendingRequestMessage m when type == MsgPendingRequest: OnHostPendingRequest(fromId, m); break;
+                case ClaimRequestMessage   when type == MsgClaimRequest:     OnHostClaimRequest(fromId);      break;
+                case ReturnMessage m       when type == MsgReturn:           OnHostReturn(fromId, m);         break;
+            }
+        }
+
+        private void HandleClientMessage(string type, object message)
+        {
+            switch (message)
+            {
+                case PendingMessage m when type == MsgPending: OnClientPending(m); break;
+                case GrantMessage m   when type == MsgGrant:   OnClientGrant(m);   break;
+            }
+        }
+
+        // ── 몬스터 자동 소환 (호스트, 접속 중 플레이어) ──────────────────────
+        // 상자는 플레이어가 창에서 직접 수령한다.
 
         private void ProcessPendingRewards()
         {
-            if (!Context.IsWorldReady) return;
-
-            foreach (var entry in State.PendingChests.ToArray())
-            {
-                long farmerId = entry.Key;
-                if (entry.Value <= 0) { State.PendingChests.Remove(farmerId); SaveState(); continue; }
-
-                Farmer? farmer = FindOnlineFarmer(farmerId);
-                if (farmer == null) continue;
-
-                // 몬스터는 자동 소환, 상자는 HUD 알림 후 F5로 수령 유도
-                Game1.addHUDMessage(new HUDMessage(
-                    $"보상 상자 {entry.Value}개 대기 중! F5를 눌러 수령하세요.",
-                    HUDMessage.newQuest_type));
-            }
+            if (!Context.IsWorldReady || !Context.IsMainPlayer) return;
 
             foreach (var entry in State.PendingMonsters.ToArray())
             {
@@ -711,6 +770,7 @@ namespace SoopStardewBridge
             RememberEvent(eventId);
 
             Monitor.Log($"후원 이벤트 접수: {eventId}, {soopId}, {balloons}개 → 상자:{chests} 몬스터:{monsters}", LogLevel.Info);
+            if (chests > 0) NotifyPending(targetFarmerId.Value);
             ProcessPendingRewards();
         }
 
@@ -730,6 +790,7 @@ namespace SoopStardewBridge
 
             RememberEvent(jobKey);
             Monitor.Log($"Central 보상 접수: {job.Id}, {job.SoopId}, {job.RewardType}×{job.Amount}, FarmerId={fid}", LogLevel.Info);
+            if (job.RewardType == "chest") NotifyPending(fid.Value);
             ProcessPendingRewards();
             return true;
         }

@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -32,6 +33,11 @@ namespace SoopStardewBridge
     internal sealed class ReturnMessage         { public int Chests { get; set; } public int PremiumChests { get; set; } }
     internal sealed class OpenRequestMessage    { public string Kind { get; set; } = "chest"; }
     internal sealed class OpenResultMessage     { public string Kind { get; set; } = "chest"; public string ItemId { get; set; } = ""; public int Amount { get; set; } public int Gold { get; set; } public string Error { get; set; } = ""; }
+    internal sealed class LinkRequestMessage    { }
+    internal sealed class LinkResponseMessage   { public string LoginUrl { get; set; } = ""; public string PageUrl { get; set; } = ""; public string SessionKey { get; set; } = ""; public string Error { get; set; } = ""; }
+    internal sealed class UnlinkRequestMessage  { }
+    internal sealed class UnlinkResponseMessage { public bool Ok { get; set; } public string Error { get; set; } = ""; }
+    internal sealed class SavedLink             { public string PageUrl { get; set; } = ""; public string SessionKey { get; set; } = ""; public string SavedAt { get; set; } = ""; }
 
     // ── 보상 수령 UI (플레이어 게임에서 표시) ──────────────────────────────
     internal sealed class RewardClaimMenu : IClickableMenu
@@ -177,6 +183,10 @@ namespace SoopStardewBridge
         private const string MsgReturn         = "Return";          // 플레이어 → 호스트 (인벤토리에 못 넣은 개수)
         private const string MsgOpenRequest    = "OpenRequest";     // 플레이어 → 호스트 (상자 열기)
         private const string MsgOpenResult     = "OpenResult";      // 호스트 → 플레이어 (뽑힌 아이템)
+        private const string MsgLinkRequest    = "LinkRequest";     // 플레이어 → 호스트 (/숲로그인)
+        private const string MsgLinkResponse   = "LinkResponse";    // 호스트 → 플레이어 (로그인 주소, 세션 키)
+        private const string MsgUnlinkRequest  = "UnlinkRequest";   // 플레이어 → 호스트 (/숲로그아웃)
+        private const string MsgUnlinkResponse = "UnlinkResponse";  // 호스트 → 플레이어
 
         private static readonly JsonSerializerOptions JsonOptions = new()
         {
@@ -200,6 +210,15 @@ namespace SoopStardewBridge
         public DateTime ClientWaitingSince;
         private bool     clientOpening;
         private DateTime clientOpeningSince;
+        private bool     clientLinkPending;
+
+        // 호스트: Central 응답을 게임 스레드에서 플레이어에게 보내기 위한 대기열
+        private readonly ConcurrentQueue<Action> hostMainThreadActions = new();
+        // 호스트: Central 폴링 때 함께 보내는 "지금 접속 중인 플레이어" 목록
+        private volatile string[] onlineFarmerSnapshot = Array.Empty<string>();
+
+        // 플레이어 게임: 숨은 Edge (SOOP 채팅 연결용)
+        private System.Diagnostics.Process? edgeProcess;
 
         // config/rules/loot는 백그라운드 타이머가 교체하고 다른 스레드가 읽으므로 volatile로 둔다.
         private volatile BridgeConfig config = new();
@@ -251,6 +270,9 @@ namespace SoopStardewBridge
             Helper.Events.Input.ButtonPressed             += OnButtonPressed;
             Helper.Events.Content.AssetRequested          += OnAssetRequested;
             Helper.Events.Multiplayer.ModMessageReceived  += OnModMessageReceived;
+            Helper.Events.GameLoop.ReturnedToTitle        += (_, _) => StopEdge("타이틀 화면으로 나감");
+            AppDomain.CurrentDomain.ProcessExit           += (_, _) => StopEdge("게임 종료");
+            CleanupOrphanEdge();   // 지난번에 게임이 튕겨서 남은 숨은 Edge가 있으면 끈다
 
             RegisterChatCommand();
             StartHttpListener();
@@ -272,7 +294,17 @@ namespace SoopStardewBridge
                     (command, chat) => OpenClaimMenu(),
                     name => "SOOP 후원 보상 수령 창을 엽니다.",
                     aliases: new[] { "우편함", "mailbox" });
-                Monitor.Log("채팅 명령어 등록: /우편함, /mailbox", LogLevel.Info);
+                ChatCommands.Register(
+                    ModManifest.UniqueID + "_login",
+                    (command, chat) => StartSoopLogin(),
+                    name => "SOOP 계정을 연결합니다. 게임이 켜져 있는 동안 내 방송의 별풍선 후원을 받습니다.",
+                    aliases: new[] { "숲로그인", "soop-login" });
+                ChatCommands.Register(
+                    ModManifest.UniqueID + "_logout",
+                    (command, chat) => StartSoopLogout(),
+                    name => "SOOP 계정 연결을 해제하고 연결 정보를 삭제합니다.",
+                    aliases: new[] { "숲로그아웃", "soop-logout" });
+                Monitor.Log("채팅 명령어 등록: /우편함, /mailbox, /숲로그인, /숲로그아웃", LogLevel.Info);
             }
             catch (Exception ex)
             {
@@ -292,6 +324,7 @@ namespace SoopStardewBridge
                 ClientWaiting = false;
                 clientOpening = false;
                 SendToHost(MsgPendingRequest, new PendingRequestMessage { Reason = "login" });
+                ResumeSavedLink();   // 전에 /숲로그인 했으면 숨은 Edge를 다시 띄운다
                 return;
             }
 
@@ -332,7 +365,16 @@ namespace SoopStardewBridge
 
             if (!Context.IsWorldReady || !Context.IsMainPlayer) return;
 
-            if (e.IsMultipleOf(60)) LogOnlineFarmers();
+            while (hostMainThreadActions.TryDequeue(out Action? action))
+            {
+                try { action(); } catch (Exception ex) { Monitor.Log($"호스트 처리 오류: {ex.Message}", LogLevel.Warn); }
+            }
+
+            if (e.IsMultipleOf(60))
+            {
+                LogOnlineFarmers();
+                onlineFarmerSnapshot = Game1.getOnlineFarmers().Select(f => f.UniqueMultiplayerID.ToString()).ToArray();
+            }
 
             while (incomingEvents.TryDequeue(out DonationEvent? d))
                 if (d != null) ProcessDonation(d);
@@ -685,6 +727,8 @@ namespace SoopStardewBridge
                         case MsgClaimRequest:   HandleHostMessage(e.Type, e.FromPlayerID, e.ReadAs<ClaimRequestMessage>());   break;
                         case MsgReturn:         HandleHostMessage(e.Type, e.FromPlayerID, e.ReadAs<ReturnMessage>());         break;
                         case MsgOpenRequest:    HandleHostMessage(e.Type, e.FromPlayerID, e.ReadAs<OpenRequestMessage>());    break;
+                        case MsgLinkRequest:    HandleHostMessage(e.Type, e.FromPlayerID, e.ReadAs<LinkRequestMessage>());    break;
+                        case MsgUnlinkRequest:  HandleHostMessage(e.Type, e.FromPlayerID, e.ReadAs<UnlinkRequestMessage>());  break;
                     }
                 }
                 else
@@ -695,6 +739,8 @@ namespace SoopStardewBridge
                         case MsgPending:    HandleClientMessage(e.Type, e.ReadAs<PendingMessage>());    break;
                         case MsgGrant:      HandleClientMessage(e.Type, e.ReadAs<GrantMessage>());      break;
                         case MsgOpenResult: HandleClientMessage(e.Type, e.ReadAs<OpenResultMessage>()); break;
+                        case MsgLinkResponse:   HandleClientMessage(e.Type, e.ReadAs<LinkResponseMessage>());   break;
+                        case MsgUnlinkResponse: HandleClientMessage(e.Type, e.ReadAs<UnlinkResponseMessage>()); break;
                     }
                 }
             }
@@ -712,6 +758,8 @@ namespace SoopStardewBridge
                 case ClaimRequestMessage m   when type == MsgClaimRequest:   OnHostClaimRequest(fromId, m);   break;
                 case ReturnMessage m         when type == MsgReturn:         OnHostReturn(fromId, m);         break;
                 case OpenRequestMessage m    when type == MsgOpenRequest:    OnHostOpenRequest(fromId, m);    break;
+                case LinkRequestMessage      when type == MsgLinkRequest:    OnHostLinkRequest(fromId);       break;
+                case UnlinkRequestMessage    when type == MsgUnlinkRequest:  OnHostUnlinkRequest(fromId);     break;
             }
         }
 
@@ -722,7 +770,263 @@ namespace SoopStardewBridge
                 case PendingMessage m    when type == MsgPending:    OnClientPending(m);    break;
                 case GrantMessage m      when type == MsgGrant:      OnClientGrant(m);      break;
                 case OpenResultMessage m when type == MsgOpenResult: OnClientOpenResult(m); break;
+                case LinkResponseMessage m   when type == MsgLinkResponse:   OnClientLinkResponse(m);   break;
+                case UnlinkResponseMessage m when type == MsgUnlinkResponse: OnClientUnlinkResponse(m); break;
             }
+        }
+
+        // ── SOOP 계정 연결 (/숲로그인, /숲로그아웃) ──────────────────────────
+        // 1) 플레이어 게임이 호스트에 요청 → 2) 호스트가 Central에서 로그인 주소와 세션 키를 받음
+        // 3) 플레이어 PC의 기본 브라우저로 SOOP 로그인 → 4) 플레이어 PC에서 숨은 Edge가 Central 연결 페이지를 열어 SDK 연결
+        // 숨은 Edge는 게임이 켜져 있는 동안만 동작한다. 게임을 끄거나 타이틀로 나가면 끈다.
+
+        private static void ChatInfo(string text)
+        {
+            if (Game1.chatBox != null) Game1.chatBox.addInfoMessage(text);
+            else Game1.addHUDMessage(new HUDMessage(text, HUDMessage.newQuest_type));
+        }
+
+        private static void ChatError(string text)
+        {
+            if (Game1.chatBox != null) Game1.chatBox.addErrorMessage(text);
+            else Game1.addHUDMessage(new HUDMessage(text, HUDMessage.error_type));
+        }
+
+        private static string LinkFileFor(long farmerId) => $"sessions/{farmerId}.json";
+
+        private void StartSoopLogin()
+        {
+            if (!Context.IsWorldReady) return;
+            if (!OperatingSystem.IsWindows()) { ChatError("SOOP 연결은 Windows에서만 지원합니다."); return; }
+            if (FindEdge() == null) { ChatError("Microsoft Edge를 찾지 못했습니다. 모드 config.json의 EdgePath에 msedge.exe 경로를 적어 주세요."); return; }
+            if (clientLinkPending) { ChatInfo("SOOP 로그인을 준비하는 중입니다. 잠시만 기다려 주세요."); return; }
+
+            clientLinkPending = true;
+            ChatInfo("SOOP 로그인을 준비하는 중입니다...");
+            SendToHost(MsgLinkRequest, new LinkRequestMessage());
+        }
+
+        private void OnClientLinkResponse(LinkResponseMessage msg)
+        {
+            clientLinkPending = false;
+            if (!string.IsNullOrEmpty(msg.Error) || string.IsNullOrEmpty(msg.SessionKey))
+            {
+                ChatError($"SOOP 로그인을 시작하지 못했습니다: {msg.Error}");
+                return;
+            }
+
+            var saved = new SavedLink { PageUrl = msg.PageUrl, SessionKey = msg.SessionKey, SavedAt = DateTime.UtcNow.ToString("o") };
+            Helper.Data.WriteJsonFile(LinkFileFor(Game1.player.UniqueMultiplayerID), saved);
+            if (!StartEdge(saved)) return;
+
+            try
+            {
+                Process.Start(new ProcessStartInfo(msg.LoginUrl) { UseShellExecute = true });
+                ChatInfo("브라우저에서 SOOP 로그인을 마치면 내 방송의 후원을 받기 시작합니다.");
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"기본 브라우저 열기 실패: {ex.Message}", LogLevel.Warn);
+                ChatError($"브라우저를 열지 못했습니다. 이 주소를 직접 열어 주세요: {msg.LoginUrl}");
+            }
+        }
+
+        // 전에 /숲로그인 했으면 접속할 때 숨은 Edge를 다시 띄운다 (SOOP 로그인이 유효하면 바로 연결된다).
+        private void ResumeSavedLink()
+        {
+            if (!OperatingSystem.IsWindows()) return;
+            SavedLink? saved = Helper.Data.ReadJsonFile<SavedLink>(LinkFileFor(Game1.player.UniqueMultiplayerID));
+            if (saved == null || string.IsNullOrEmpty(saved.SessionKey)) return;
+            if (StartEdge(saved))
+                ChatInfo("SOOP 방송 연결을 다시 시작합니다. (해제하려면 /숲로그아웃)");
+        }
+
+        private void StartSoopLogout()
+        {
+            if (!Context.IsWorldReady) return;
+            StopEdge("/숲로그아웃");
+            Helper.Data.WriteJsonFile<SavedLink>(LinkFileFor(Game1.player.UniqueMultiplayerID), null);   // 이 PC에 저장한 세션 키 삭제
+            ChatInfo("SOOP 연결을 해제하는 중입니다...");
+            SendToHost(MsgUnlinkRequest, new UnlinkRequestMessage());
+        }
+
+        private void OnClientUnlinkResponse(UnlinkResponseMessage msg)
+        {
+            if (msg.Ok) ChatInfo("SOOP 연결을 해제하고 연결 정보를 삭제했습니다.");
+            else ChatError($"관리자 서버의 연결 정보 삭제에 실패했습니다: {msg.Error} (이 PC의 연결은 이미 끊었습니다)");
+        }
+
+        // 호스트: 플레이어 대신 Central에 요청한다 (서버 토큰은 호스트에만 있다).
+        private void OnHostLinkRequest(long fromId)
+        {
+            Farmer? farmer = FindOnlineFarmer(fromId);
+            BridgeConfig cfg = config;
+            if (string.IsNullOrWhiteSpace(cfg.CentralServerUrl) || string.IsNullOrWhiteSpace(cfg.AgentToken))
+            {
+                SendToPlayer(fromId, MsgLinkResponse, new LinkResponseMessage { Error = "게임 서버에 관리자 서버(Central) 연결이 설정되지 않았습니다." });
+                return;
+            }
+
+            string farmerName = farmer?.Name ?? "";
+            Monitor.Log($"/숲로그인 요청: {farmerName} (FarmerId={fromId})", LogLevel.Info);
+            _ = Task.Run(async () =>
+            {
+                LinkResponseMessage reply;
+                try
+                {
+                    var (ok, json, error) = await CentralPostAsync(cfg, "/api/agent/link/start", new { farmerId = fromId.ToString(), farmerName }).ConfigureAwait(false);
+                    reply = ok
+                        ? new LinkResponseMessage { LoginUrl = Str(json, "loginUrl"), PageUrl = Str(json, "pageUrl"), SessionKey = Str(json, "sessionKey") }
+                        : new LinkResponseMessage { Error = error };
+                }
+                catch (Exception ex)
+                {
+                    reply = new LinkResponseMessage { Error = $"관리자 서버에 연결하지 못했습니다: {ex.Message}" };
+                }
+                hostMainThreadActions.Enqueue(() => SendToPlayer(fromId, MsgLinkResponse, reply));
+            });
+        }
+
+        private void OnHostUnlinkRequest(long fromId)
+        {
+            BridgeConfig cfg = config;
+            if (string.IsNullOrWhiteSpace(cfg.CentralServerUrl) || string.IsNullOrWhiteSpace(cfg.AgentToken))
+            {
+                SendToPlayer(fromId, MsgUnlinkResponse, new UnlinkResponseMessage { Error = "게임 서버에 관리자 서버(Central) 연결이 설정되지 않았습니다." });
+                return;
+            }
+
+            Monitor.Log($"/숲로그아웃 요청: FarmerId={fromId}", LogLevel.Info);
+            _ = Task.Run(async () =>
+            {
+                UnlinkResponseMessage reply;
+                try
+                {
+                    var (ok, _, error) = await CentralPostAsync(cfg, "/api/agent/link/remove", new { farmerId = fromId.ToString() }).ConfigureAwait(false);
+                    reply = new UnlinkResponseMessage { Ok = ok, Error = error };
+                }
+                catch (Exception ex)
+                {
+                    reply = new UnlinkResponseMessage { Error = $"관리자 서버에 연결하지 못했습니다: {ex.Message}" };
+                }
+                hostMainThreadActions.Enqueue(() => SendToPlayer(fromId, MsgUnlinkResponse, reply));
+            });
+        }
+
+        private async Task<(bool ok, JsonElement json, string error)> CentralPostAsync(BridgeConfig cfg, string path, object body)
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Post, cfg.CentralServerUrl.TrimEnd('/') + path);
+            req.Headers.Add("X-Agent-Token", cfg.AgentToken);
+            req.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+            using HttpResponseMessage resp = await centralHttp.SendAsync(req).ConfigureAwait(false);
+            string text = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+
+            JsonElement json = default;
+            try { json = JsonDocument.Parse(string.IsNullOrWhiteSpace(text) ? "{}" : text).RootElement.Clone(); } catch (JsonException) { }
+            if (resp.IsSuccessStatusCode) return (true, json, "");
+            string error = Str(json, "error");
+            return (false, json, string.IsNullOrEmpty(error) ? $"HTTP {(int)resp.StatusCode}" : error);
+        }
+
+        private static string Str(JsonElement json, string name)
+            => json.ValueKind == JsonValueKind.Object && json.TryGetProperty(name, out JsonElement v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
+
+        // ── 숨은 Edge 실행/종료 (플레이어 PC) ────────────────────────────────
+
+        private string EdgeProfileDir => Path.Combine(Helper.DirectoryPath, "edge-profile");   // 평소 브라우저와 분리된 전용 저장 공간
+        private string EdgePidFile    => Path.Combine(Helper.DirectoryPath, "edge.pid");
+
+        private string? FindEdge()
+        {
+            if (!OperatingSystem.IsWindows()) return null;
+            string custom = config.EdgePath;
+            if (!string.IsNullOrWhiteSpace(custom) && File.Exists(custom)) return custom;
+            foreach (string baseDir in new[] { Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles) })
+            {
+                if (string.IsNullOrEmpty(baseDir)) continue;
+                string path = Path.Combine(baseDir, "Microsoft", "Edge", "Application", "msedge.exe");
+                if (File.Exists(path)) return path;
+            }
+            return null;
+        }
+
+        private bool StartEdge(SavedLink link)
+        {
+            StopEdge("새 연결 시작");
+            string? exe = FindEdge();
+            if (exe == null)
+            {
+                ChatError("Microsoft Edge를 찾지 못했습니다. 모드 config.json의 EdgePath에 msedge.exe 경로를 적어 주세요.");
+                return false;
+            }
+
+            // 세션 키는 # 뒤에 둔다. 브라우저가 서버로 보내지 않아 서버 로그에 남지 않는다.
+            string url = $"{link.PageUrl}#k={Uri.EscapeDataString(link.SessionKey)}";
+            var psi = new ProcessStartInfo(exe) { UseShellExecute = false, CreateNoWindow = true };
+            bool headless = config.EdgeHeadless;
+            if (headless) psi.ArgumentList.Add("--headless=new");
+            psi.ArgumentList.Add($"--user-data-dir={EdgeProfileDir}");
+            foreach (string flag in new[] { "--no-first-run", "--no-default-browser-check", "--disable-extensions", "--mute-audio",
+                                             "--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows" })
+                psi.ArgumentList.Add(flag);
+            if (headless) psi.ArgumentList.Add(url);
+            else { psi.ArgumentList.Add("--window-size=560,440"); psi.ArgumentList.Add($"--app={url}"); }
+
+            try
+            {
+                edgeProcess = Process.Start(psi);
+                if (edgeProcess == null) throw new InvalidOperationException("프로세스를 시작하지 못했습니다.");
+                File.WriteAllText(EdgePidFile, $"{edgeProcess.Id}|{edgeProcess.StartTime.ToUniversalTime().Ticks}");
+                Monitor.Log($"숨은 Edge 시작 (PID {edgeProcess.Id}, {(headless ? "화면 없음" : "창 모드")})", LogLevel.Info);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"Edge 실행 실패: {ex.Message}", LogLevel.Error);
+                ChatError($"SOOP 연결용 Edge를 실행하지 못했습니다: {ex.Message}");
+                return false;
+            }
+        }
+
+        private void StopEdge(string reason)
+        {
+            System.Diagnostics.Process? p = edgeProcess;
+            edgeProcess = null;
+            try
+            {
+                if (p != null && !p.HasExited)
+                {
+                    p.Kill(entireProcessTree: true);
+                    Monitor.Log($"숨은 Edge 종료: {reason}", LogLevel.Info);
+                }
+            }
+            catch (Exception ex) { Monitor.Log($"숨은 Edge 종료 실패: {ex.Message}", LogLevel.Warn); }
+            try { if (File.Exists(EdgePidFile)) File.Delete(EdgePidFile); } catch { }
+        }
+
+        // 게임이 튕기면 Edge를 끌 기회가 없다. 다음에 게임을 켤 때 기록해 둔 그 Edge만 골라서 끈다.
+        private void CleanupOrphanEdge()
+        {
+            try
+            {
+                if (!File.Exists(EdgePidFile)) return;
+                string[] parts = File.ReadAllText(EdgePidFile).Split('|');
+                if (parts.Length == 2 && int.TryParse(parts[0], out int pid) && long.TryParse(parts[1], out long ticks))
+                {
+                    try
+                    {
+                        using System.Diagnostics.Process p = System.Diagnostics.Process.GetProcessById(pid);
+                        if (p.StartTime.ToUniversalTime().Ticks == ticks)   // PID가 다른 프로그램에 재사용된 경우는 건드리지 않는다
+                        {
+                            p.Kill(entireProcessTree: true);
+                            Monitor.Log("지난번에 남은 숨은 Edge를 종료했습니다.", LogLevel.Info);
+                        }
+                    }
+                    catch (ArgumentException) { /* 이미 종료됨 */ }
+                }
+                File.Delete(EdgePidFile);
+            }
+            catch (Exception ex) { Monitor.Log($"남은 Edge 정리 실패: {ex.Message}", LogLevel.Trace); }
         }
 
         // ── 몬스터 자동 소환 (호스트, 접속 중 플레이어) ──────────────────────
@@ -842,7 +1146,8 @@ namespace SoopStardewBridge
                 {
                     using var req = new HttpRequestMessage(HttpMethod.Post, baseUrl + "/api/agent/poll");
                     req.Headers.Add("X-Agent-Token", cfg.AgentToken);
-                    req.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+                    // 지금 접속 중인 플레이어 목록을 같이 보낸다. Central은 게임에 없는 스트리머의 SOOP 연결을 끊는다.
+                    req.Content = new StringContent(JsonSerializer.Serialize(new { onlineFarmerIds = onlineFarmerSnapshot }), Encoding.UTF8, "application/json");
                     using HttpResponseMessage resp = await centralHttp.SendAsync(req, ct).ConfigureAwait(false);
                     string json = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
                     if (resp.IsSuccessStatusCode)
@@ -1512,6 +1817,10 @@ namespace SoopStardewBridge
             public string CentralServerUrl { get; set; } = "";
             public string AgentToken       { get; set; } = "";
             public int    PollIntervalSeconds { get; set; } = 8;
+            // 플레이어 게임: SOOP 연결용 Edge. 비워 두면 기본 설치 경로에서 찾는다.
+            public string EdgePath     { get; set; } = "";
+            // true = 화면 없이 실행, false = 작은 창으로 실행 (연결 문제를 눈으로 확인할 때)
+            public bool   EdgeHeadless { get; set; } = true;
         }
 
         private sealed class DonationEvent

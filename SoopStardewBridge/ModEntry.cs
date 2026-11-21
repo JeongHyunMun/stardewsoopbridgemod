@@ -27,9 +27,14 @@ namespace SoopStardewBridge
     // 보상 대기열(state.json)과 아이템 목록(loot.json)은 호스트(Docker 서버)에만 있다.
     // 플레이어 게임은 창을 띄우고 자기 인벤토리를 바꾸는 일만 하며, 필요한 정보는 SMAPI 멀티플레이 메시지로 주고받는다.
     internal sealed class PendingRequestMessage { public string Reason { get; set; } = "query"; }
-    internal sealed class PendingMessage        { public int Chests { get; set; } public int PremiumChests { get; set; } public int Items { get; set; } public string FirstItemId { get; set; } = ""; public string Reason { get; set; } = "query"; public string LinkPageUrl { get; set; } = ""; }
-    internal sealed class ClaimRequestMessage   { public string Kind { get; set; } = "all"; }   // chest | premiumChest | item | all
-    internal sealed class GrantMessage          { public int Chests { get; set; } public int PremiumChests { get; set; } public List<PendingItem> Items { get; set; } = new(); public int RemainingChests { get; set; } public int RemainingPremiumChests { get; set; } public int RemainingItems { get; set; } public string FirstItemId { get; set; } = ""; }
+    internal sealed class PendingMessage        { public int Chests { get; set; } public int PremiumChests { get; set; } public int Items { get; set; } public string FirstItemId { get; set; } = ""; public string Reason { get; set; } = "query"; public string LinkPageUrl { get; set; } = ""; public List<MailSlot> Slots { get; set; } = new(); }
+    internal sealed class ClaimRequestMessage   { public string Kind { get; set; } = "all"; public List<MailSlot> Slots { get; set; } = new(); }   // Slots가 있으면 그 칸들만, 없으면 Kind(chest | premiumChest | item | all)로 받는다
+    internal sealed class GrantMessage          { public int Chests { get; set; } public int PremiumChests { get; set; } public List<PendingItem> Items { get; set; } = new(); public int RemainingChests { get; set; } public int RemainingPremiumChests { get; set; } public int RemainingItems { get; set; } public string FirstItemId { get; set; } = ""; public List<MailSlot> Slots { get; set; } = new(); }
+    // 우편함 한 칸: 같은 아이템 한 묶음 (Amount는 한 칸에 쌓을 수 있는 최대 개수 이하)
+    public sealed class MailSlot                { public string Kind { get; set; } = ""; public string ItemId { get; set; } = ""; public int Quality { get; set; } public int Amount { get; set; } public string Name { get; set; } = ""; }
+    // 시세 변동: 호스트가 정하고 모든 플레이어에게 알린다. 아이템별 퍼센트는 Seed와 아이템 ID로 같은 값이 나온다.
+    public sealed class PriceShiftState         { public int Seed { get; set; } public int ExpiresDay { get; set; } public int MaxIncreasePercent { get; set; } public int MaxDecreasePercent { get; set; } }
+    internal sealed class StateSyncMessage      { public PriceShiftState? PriceShift { get; set; } public int FoodHealth { get; set; } public int FoodEnergy { get; set; } public bool Announce { get; set; } }
     internal sealed class ReturnMessage         { public int Chests { get; set; } public int PremiumChests { get; set; } public List<PendingItem> Items { get; set; } = new(); }
     // 관리자 페이지에서 지급한 아이템 (Central 작업 rewardType = "item")
     public sealed class PendingItem             { public string ItemId { get; set; } = ""; public int Amount { get; set; } public int Quality { get; set; } public string Name { get; set; } = ""; }
@@ -38,22 +43,29 @@ namespace SoopStardewBridge
     internal sealed class LinkRequestMessage    { }
     internal sealed class LinkResponseMessage   { public string LoginUrl { get; set; } = ""; public string PageUrl { get; set; } = ""; public string SessionKey { get; set; } = ""; public string Error { get; set; } = ""; }
     internal sealed class UnlinkRequestMessage  { }
+    internal sealed class FestivalVoteMessage   { }
+    // 호스트 → 플레이어 안내. 서버 채팅으로 보내면 서버 언어(영어) 글꼴로 그려져 한글이 깨지므로, 플레이어 게임이 직접 노란 안내로 띄운다.
+    internal sealed class NoticeMessage         { public string Text { get; set; } = ""; }   // 플레이어 → 호스트 (/축제시작)
     internal sealed class UnlinkResponseMessage { public bool Ok { get; set; } public string Error { get; set; } = ""; }
     internal sealed class LinkStatusMessage     { public string Kind { get; set; } = "info"; public string Message { get; set; } = ""; }   // info | success | error
     internal sealed class SavedLink             { public string PageUrl { get; set; } = ""; public string SessionKey { get; set; } = ""; public string SavedAt { get; set; } = ""; }
 
-    // ── 보상 수령 UI (플레이어 게임에서 표시) ──────────────────────────────
+    // ── 보상 수령 UI: 9×6(54칸) 우편함 (플레이어 게임에서 표시) ───────────────
+    // 칸 하나 = 같은 아이템 한 묶음(한 칸에 쌓을 수 있는 최대 개수까지). 칸을 클릭하면 그 칸의 수량 전체를 받는다.
     internal sealed class RewardClaimMenu : IClickableMenu
     {
-        private const int MenuWidth  = 600;
-        private const int MenuHeight = 504;
+        private const int Cols = 9, Rows = 6, PerPage = Cols * Rows;
+        private const int Cell = 60, Gap = 4, Pad = 36, GridTop = 100, BottomBar = 84;
+        private const int GridW = Cols * (Cell + Gap) - Gap;
+        private const int GridH = Rows * (Cell + Gap) - Gap;
+        private const int MenuWidth  = GridW + Pad * 2;
+        private const int MenuHeight = GridTop + GridH + BottomBar;
 
         private readonly ModEntry _mod;
-        private readonly Item _normalIcon;
-        private readonly Item _premiumIcon;
-        private Item? _itemIcon;
-        private string _itemIconId = "";
-        private Rectangle _normalBtn, _premiumBtn, _itemBtn, _allBtn;
+        private readonly List<Item?> _icons = new();
+        private int _iconsVersion = -1;
+        private int _page;
+        private Rectangle _prevBtn, _nextBtn, _allBtn;
         private ClickableTextureComponent _closeBtn = null!;
 
         public RewardClaimMenu(ModEntry mod) : base(
@@ -62,21 +74,41 @@ namespace SoopStardewBridge
             MenuWidth, MenuHeight)
         {
             _mod = mod;
-            _normalIcon  = ItemRegistry.Create(ModEntry.NormalChestId, 1);
-            _premiumIcon = ItemRegistry.Create(ModEntry.PremiumChestId, 1);
             RebuildButtons();
             Game1.playSound("shwip");
         }
 
-        private int RowY(int index) => yPositionOnScreen + 104 + index * 84;
+        private int PageCount => Math.Max(1, (_mod.ClientSlots.Count + PerPage - 1) / PerPage);
+
+        private Rectangle CellRect(int cellIndex)
+        {
+            int c = cellIndex % Cols, r = cellIndex / Cols;
+            return new Rectangle(xPositionOnScreen + Pad + c * (Cell + Gap), yPositionOnScreen + GridTop + r * (Cell + Gap), Cell, Cell);
+        }
+
+        private int CellAt(int x, int y)
+        {
+            for (int i = 0; i < PerPage; i++) if (CellRect(i).Contains(x, y)) return i;
+            return -1;
+        }
+
+        // 호스트가 새 목록을 보내면 아이콘을 다시 만든다.
+        private void SyncIcons()
+        {
+            if (_iconsVersion == _mod.ClientSlotsVersion) return;
+            _iconsVersion = _mod.ClientSlotsVersion;
+            _icons.Clear();
+            foreach (MailSlot slot in _mod.ClientSlots) _icons.Add(ModEntry.CreateSlotItem(slot));
+            _page = Math.Clamp(_page, 0, PageCount - 1);
+        }
 
         private void RebuildButtons()
         {
-            int btnX = xPositionOnScreen + width - 64 - 140;
-            _normalBtn  = new Rectangle(btnX, RowY(0) + 2, 140, 60);
-            _premiumBtn = new Rectangle(btnX, RowY(1) + 2, 140, 60);
-            _itemBtn    = new Rectangle(btnX, RowY(2) + 2, 140, 60);
-            _allBtn     = new Rectangle(xPositionOnScreen + width / 2 - 130, yPositionOnScreen + height - 100, 260, 64);
+            int by = yPositionOnScreen + GridTop + GridH + 18;
+            // 이전 | 다음 | (쪽 번호, 가운데) | 전체 수령. 쪽 번호가 버튼에 겹치지 않게 버튼 폭을 줄이고 사이 공간에 둔다.
+            _prevBtn = new Rectangle(xPositionOnScreen + Pad, by, 96, 56);
+            _nextBtn = new Rectangle(_prevBtn.Right + 8, by, 96, 56);
+            _allBtn  = new Rectangle(xPositionOnScreen + width - Pad - 200, by, 200, 56);
             _closeBtn = new ClickableTextureComponent(
                 new Rectangle(xPositionOnScreen + width - 44, yPositionOnScreen - 4, 48, 48),
                 Game1.mouseCursors, new Rectangle(337, 494, 12, 12), 4f);
@@ -98,49 +130,77 @@ namespace SoopStardewBridge
                 enabled ? Game1.textColor : Game1.textColor * 0.4f);
         }
 
-        private void DrawRow(SpriteBatch b, int index, Item icon, string name, int count, Rectangle btn)
-        {
-            int y = RowY(index);
-            icon.drawInMenu(b, new Vector2(xPositionOnScreen + 40, y), 1f);
-            b.DrawString(Game1.dialogueFont, name, new Vector2(xPositionOnScreen + 120, y + 14), Game1.textColor);
-            string countText = $"{count} 개";
-            Vector2 cs = Game1.dialogueFont.MeasureString(countText);
-            b.DrawString(Game1.dialogueFont, countText, new Vector2(btn.X - 28 - cs.X, y + 14), count > 0 ? Game1.textColor : Game1.textColor * 0.45f);
-            DrawButton(b, btn, "수령", !_mod.ClientWaiting && count > 0);
-        }
+        private List<MailSlot> PageSlots()
+            => _mod.ClientSlots.Skip(_page * PerPage).Take(PerPage).ToList();
 
         public override void draw(SpriteBatch b)
         {
+            SyncIcons();
             b.Draw(Game1.fadeToBlackRect, new Rectangle(0, 0, Game1.uiViewport.Width, Game1.uiViewport.Height), Color.Black * 0.4f);
             drawTextureBox(b, Game1.menuTexture, new Rectangle(0, 256, 60, 60),
                 xPositionOnScreen, yPositionOnScreen, width, height, Color.White, 1f, false);
 
-            DrawCentered(b, "SOOP 후원 보상", yPositionOnScreen + 28, Game1.textColor);
-            b.Draw(Game1.staminaRect, new Rectangle(xPositionOnScreen + 24, yPositionOnScreen + 84, width - 48, 2), Color.Gray * 0.5f);
+            DrawCentered(b, "SOOP 우편함", yPositionOnScreen + 24, Game1.textColor);
+            int total = _mod.ClientPendingChests + _mod.ClientPendingPremiumChests + _mod.ClientPendingItems;
+            string sub = total > 0 ? $"대기 중인 보상 {total}개 · 칸을 클릭하면 받습니다" : "칸을 클릭하면 받습니다";
+            Vector2 subSize = Game1.smallFont.MeasureString(sub);
+            b.DrawString(Game1.smallFont, sub, new Vector2(xPositionOnScreen + (width - subSize.X) / 2f, yPositionOnScreen + 62), Game1.textColor * 0.7f);
+            b.Draw(Game1.staminaRect, new Rectangle(xPositionOnScreen + 24, yPositionOnScreen + 90, width - 48, 2), Color.Gray * 0.5f);
 
-            if (_mod.ClientWaiting && (DateTime.UtcNow - _mod.ClientWaitingSince).TotalSeconds > 6)
+            bool waiting = _mod.ClientWaiting;
+            bool unresponsive = waiting && (DateTime.UtcNow - _mod.ClientWaitingSince).TotalSeconds > 6;
+            var slots = _mod.ClientSlots;
+            int mx = Game1.getMouseX(), my = Game1.getMouseY();
+            Item? hover = null;
+
+            for (int i = 0; i < PerPage; i++)
             {
-                DrawCentered(b, "서버가 응답하지 않습니다.", RowY(0) + 20, Game1.textColor * 0.7f);
-                DrawCentered(b, "서버에 모드가 설치되어 있는지 확인하세요.", RowY(1) + 10, Game1.textColor * 0.6f);
-            }
-            else
-            {
-                int normal  = _mod.ClientPendingChests;
-                int premium = _mod.ClientPendingPremiumChests;
-                int items   = _mod.ClientPendingItems;
-                // 지급 아이템 칸 아이콘은 대기 중인 첫 아이템으로 보여 준다.
-                if (_itemIcon == null || _itemIconId != _mod.ClientFirstItemId)
+                Rectangle r = CellRect(i);
+                b.Draw(Game1.menuTexture, r, Game1.getSourceRectForStandardTileSheet(Game1.menuTexture, 10), Color.White);
+                int idx = _page * PerPage + i;
+                if (idx >= slots.Count) continue;
+
+                bool over = r.Contains(mx, my);
+                if (over && !waiting) b.Draw(Game1.staminaRect, r, Color.Wheat * 0.4f);
+                Item? icon = idx < _icons.Count ? _icons[idx] : null;
+                if (icon != null)
                 {
-                    _itemIconId = _mod.ClientFirstItemId;
-                    _itemIcon = ModEntry.CreateGrantItem(_itemIconId, 1, 0) ?? ItemRegistry.Create("(O)MysteryBox", 1);
+                    icon.drawInMenu(b, new Vector2(r.X, r.Y), Cell / 64f);
+                    if (over) hover = icon;
                 }
-                DrawRow(b, 0, _normalIcon,  "일반 상자",   normal,  _normalBtn);
-                DrawRow(b, 1, _premiumIcon, "고급 상자",   premium, _premiumBtn);
-                DrawRow(b, 2, _itemIcon,    "지급 아이템", items,   _itemBtn);
-                DrawButton(b, _allBtn, "전체 수령", !_mod.ClientWaiting && normal + premium + items > 0);
+                else
+                {
+                    b.DrawString(Game1.smallFont, "?", new Vector2(r.X + 22, r.Y + 16), Game1.textColor * 0.6f);
+                }
             }
+
+            float midY = yPositionOnScreen + GridTop + GridH / 2f - 20;
+            if (unresponsive)
+            {
+                DrawCentered(b, "서버가 응답하지 않습니다.", midY - 20, Game1.textColor * 0.8f);
+                DrawCentered(b, "서버에 모드가 설치되어 있는지 확인하세요.", midY + 24, Game1.textColor * 0.7f);
+            }
+            else if (slots.Count == 0)
+            {
+                DrawCentered(b, waiting ? "불러오는 중..." : "받을 보상이 없습니다.", midY, Game1.textColor * 0.7f);
+            }
+            else if (total > slots.Sum(s => s.Amount))
+            {
+                string more = "표시되지 않은 보상은 받고 나면 이어서 나타납니다.";
+                Vector2 ms = Game1.smallFont.MeasureString(more);
+                b.DrawString(Game1.smallFont, more, new Vector2(xPositionOnScreen + (width - ms.X) / 2f, yPositionOnScreen + GridTop + GridH + 2), Game1.textColor * 0.6f);
+            }
+
+            DrawButton(b, _prevBtn, "이전", _page > 0);
+            DrawButton(b, _nextBtn, "다음", _page < PageCount - 1);
+            string pageText = $"{_page + 1} / {PageCount}";
+            Vector2 ps = Game1.dialogueFont.MeasureString(pageText);
+            float gapCenter = (_nextBtn.Right + _allBtn.Left) / 2f;
+            b.DrawString(Game1.dialogueFont, pageText, new Vector2(gapCenter - ps.X / 2f, _nextBtn.Y + (_nextBtn.Height - ps.Y) / 2f + 4), Game1.textColor);
+            DrawButton(b, _allBtn, "전체 수령", !waiting && PageSlots().Count > 0);
 
             _closeBtn.draw(b);
+            if (hover != null) drawToolTip(b, hover.getDescription(), hover.DisplayName, hover);
             drawMouse(b);
         }
 
@@ -154,10 +214,33 @@ namespace SoopStardewBridge
             }
             if (_mod.ClientWaiting) return;
 
-            if      (_normalBtn.Contains(x, y)  && _mod.ClientPendingChests > 0)        _mod.RequestClaim(ModEntry.KindNormal);
-            else if (_premiumBtn.Contains(x, y) && _mod.ClientPendingPremiumChests > 0) _mod.RequestClaim(ModEntry.KindPremium);
-            else if (_itemBtn.Contains(x, y)    && _mod.ClientPendingItems > 0)         _mod.RequestClaim(ModEntry.KindItem);
-            else if (_allBtn.Contains(x, y)     && _mod.ClientPendingChests + _mod.ClientPendingPremiumChests + _mod.ClientPendingItems > 0) _mod.RequestClaim(ModEntry.KindAll);
+            if (_prevBtn.Contains(x, y))
+            {
+                if (_page > 0) { _page--; Game1.playSound("shwip"); }
+                return;
+            }
+            if (_nextBtn.Contains(x, y))
+            {
+                if (_page < PageCount - 1) { _page++; Game1.playSound("shwip"); }
+                return;
+            }
+            if (_allBtn.Contains(x, y))
+            {
+                var page = PageSlots();
+                if (page.Count > 0) _mod.RequestClaimSlots(page);
+                return;
+            }
+
+            int cell = CellAt(x, y);
+            if (cell < 0) return;
+            int idx = _page * PerPage + cell;
+            if (idx < _mod.ClientSlots.Count) _mod.RequestClaimSlots(new List<MailSlot> { _mod.ClientSlots[idx] });
+        }
+
+        public override void receiveScrollWheelAction(int direction)
+        {
+            if (direction > 0 && _page > 0) { _page--; Game1.playSound("shwip"); }
+            else if (direction < 0 && _page < PageCount - 1) { _page++; Game1.playSound("shwip"); }
         }
 
         public override void receiveKeyPress(Keys key)
@@ -178,7 +261,7 @@ namespace SoopStardewBridge
     }
 
     // ── 메인 모드 ─────────────────────────────────────────────────────────────
-    internal sealed class ModEntry : Mod
+    internal sealed partial class ModEntry : Mod
     {
         // 일반 상자는 예전 ID를 그대로 써서 이미 받은 상자도 일반 상자가 된다.
         public const string NormalChestId  = "SoopStardewBridge_RewardChest";
@@ -191,9 +274,16 @@ namespace SoopStardewBridge
         public const string KindPremium = "premiumChest";
         public const string KindItem    = "item";      // 관리자 페이지에서 지급한 아이템
         public const string KindAll     = "all";
+        public const string KindTax        = "tax";          // 세금 징수 (별풍선 보상)
+        public const string KindFood       = "food";         // 뼈고기 지급
+        public const string KindPriceShift = "priceShift";   // 시세 변동
+        public const string BoneMeatId = "SoopStardewBridge_BoneMeat";
+        private const string BoneMeatTextureAsset = "SoopStardewBridge/bone_meat";
+        private const int MaxSlotsSent = 270;   // 우편함 한 번에 보내는 최대 칸 수 (5페이지)
 
         private const string MsgPendingRequest = "PendingRequest";  // 플레이어 → 호스트
         private const string MsgPending        = "Pending";         // 호스트 → 플레이어
+        private const string MsgStateSync      = "StateSync";       // 호스트 → 플레이어 (시세 변동, 음식 수치)
         private const string MsgClaimRequest   = "ClaimRequest";    // 플레이어 → 호스트
         private const string MsgGrant          = "Grant";           // 호스트 → 플레이어
         private const string MsgReturn         = "Return";          // 플레이어 → 호스트 (인벤토리에 못 넣은 개수)
@@ -201,8 +291,10 @@ namespace SoopStardewBridge
         private const string MsgOpenResult     = "OpenResult";      // 호스트 → 플레이어 (뽑힌 아이템)
         private const string MsgLinkRequest    = "LinkRequest";     // 플레이어 → 호스트 (/숲로그인)
         private const string MsgLinkResponse   = "LinkResponse";    // 호스트 → 플레이어 (로그인 주소, 세션 키)
+        private const string MsgFestivalVote   = "FestivalVote";    // 플레이어 → 호스트 (/축제시작 찬성)
         private const string MsgUnlinkRequest  = "UnlinkRequest";   // 플레이어 → 호스트 (/숲로그아웃)
         private const string MsgUnlinkResponse = "UnlinkResponse";  // 호스트 → 플레이어
+        private const string MsgNotice         = "Notice";          // 호스트 → 플레이어 (노란 안내 문구)
         private const string MsgLinkStatus     = "LinkStatus";      // 호스트 → 플레이어 (SOOP 연동 성공/실패 알림)
 
         private static readonly JsonSerializerOptions JsonOptions = new()
@@ -226,6 +318,13 @@ namespace SoopStardewBridge
         public int      ClientPendingPremiumChests;
         public int      ClientPendingItems;          // 지급 아이템 총 개수
         public string   ClientFirstItemId = "";
+        public List<MailSlot> ClientSlots = new();   // 우편함 칸 목록 (호스트가 보내 준 값)
+        public int      ClientSlotsVersion;
+        // 시세 변동 / 음식 (호스트가 정한 값을 모든 플레이어가 같이 쓴다)
+        private PriceShiftState? activeShift;
+        private int  foodHealth = 50, foodEnergy = 100;
+        private bool boneEating;
+        private readonly System.Runtime.CompilerServices.ConditionalWeakTable<IClickableMenu, object> adjustedShops = new();
         public bool     ClientWaiting;
         public DateTime ClientWaitingSince;
         private bool     clientOpening;
@@ -269,7 +368,12 @@ namespace SoopStardewBridge
 
         public override void Entry(IModHelper helper)
         {
-            config = Helper.ReadConfig<BridgeConfig>();
+            // Helper.ReadConfig는 읽을 때 파일을 다시 써서 config.json의 // 주석을 지운다. 그래서 쓰기 없이 읽고, 파일이 없을 때만 만든다.
+            BridgeConfig? fileConfig = null;
+            try { fileConfig = Helper.Data.ReadJsonFile<BridgeConfig>(ConfigFileName); }
+            catch (Exception ex) { Monitor.Log($"config.json을 읽지 못해 기본값으로 시작합니다: {ex.Message}", LogLevel.Error); }
+            config = fileConfig ?? new BridgeConfig();
+            if (fileConfig == null && !File.Exists(Path.Combine(Helper.DirectoryPath, ConfigFileName))) Helper.WriteConfig(config);
 
             if (string.IsNullOrWhiteSpace(config.AuthToken))
             {
@@ -287,11 +391,22 @@ namespace SoopStardewBridge
             EnsureMonstersFile();
             ReloadMonsters(force: true);
 
+            // 한 계정 = 캐릭터 하나 (게임 서버에서만 효과가 있다. config.json의 OneCharacterPerAccount로 끄고 켬)
+            OneCharacterGate.Apply(ModManifest.UniqueID, Monitor, () => config.OneCharacterPerAccount);
+            // 끊긴 연결이 남아 있어도 같은 계정이 다시 들어오면 정리해서 자기 캐릭터로 접속하게 한다 (ReconnectFix.cs)
+            ReconnectFix.Apply(ModManifest.UniqueID, Monitor);
+            // 소리 없는 게임 서버에서 동굴 파리 등이 매 프레임 오류를 내며 게임을 멈추는 문제 방지
+            HeadlessSoundFix.Apply(ModManifest.UniqueID, Monitor);
+            InitGoal();   // 공동 목표 (GoalFeature.cs)
+            // 축제 이벤트 투표 시작 (JunimoServer가 있는 게임 서버에서만). 모든 모드가 로드된 뒤에 건다.
+            Helper.Events.GameLoop.GameLaunched += (_, _) => FestivalVote.Apply(ModManifest.UniqueID, Monitor, () => config.FestivalVote, () => config.FestivalVoteRatio, Notice);
+
             Helper.Events.GameLoop.SaveLoaded             += OnSaveLoaded;
             Helper.Events.GameLoop.DayStarted             += OnDayStarted;
             Helper.Events.GameLoop.UpdateTicked           += OnUpdateTicked;
             Helper.Events.Input.ButtonPressed             += OnButtonPressed;
             Helper.Events.Content.AssetRequested          += OnAssetRequested;
+            Helper.Events.Display.MenuChanged             += OnMenuChanged;
             Helper.Events.Multiplayer.ModMessageReceived  += OnModMessageReceived;
             Helper.Events.GameLoop.ReturnedToTitle        += (_, _) => StopEdge("타이틀 화면으로 나감");
             AppDomain.CurrentDomain.ProcessExit           += (_, _) => StopEdge("게임 종료");
@@ -327,7 +442,12 @@ namespace SoopStardewBridge
                     (command, chat) => StartSoopLogout(),
                     name => "SOOP 계정 연결을 해제하고 연결 정보를 삭제합니다.",
                     aliases: new[] { "숲로그아웃", "soop-logout" });
-                Monitor.Log("채팅 명령어 등록: /우편함, /mailbox, /숲로그인, /숲로그아웃", LogLevel.Info);
+                ChatCommands.Register(
+                    ModManifest.UniqueID + "_festival",
+                    (command, chat) => SendToHost(MsgFestivalVote, new FestivalVoteMessage()),
+                    name => "축제 이벤트(달걀 찾기 등) 시작에 찬성합니다. 참가자 과반수가 찬성하면 시작합니다.",
+                    aliases: new[] { "축제시작", "festival-start" });
+                Monitor.Log("채팅 명령어 등록: /우편함, /mailbox, /숲로그인, /숲로그아웃, /축제시작", LogLevel.Info);
             }
             catch (Exception ex)
             {
@@ -344,6 +464,8 @@ namespace SoopStardewBridge
                 // 플레이어 게임: 접속하면 호스트에 내 대기 보상을 물어본다 (있으면 HUD 알림).
                 ClientPendingChests = 0;
                 ClientPendingPremiumChests = 0;
+                ClientSlots = new(); ClientSlotsVersion++;
+                activeShift = null;
                 ClientWaiting = false;
                 clientOpening = false;
                 // 호스트의 답(Pending, reason=login)을 받으면 저장된 SOOP 연결을 다시 띄운다 (현재 인증 도메인을 그때 받는다).
@@ -352,6 +474,8 @@ namespace SoopStardewBridge
             }
 
             State = Helper.Data.ReadJsonFile<BridgeState>("state.json") ?? State;
+            activeShift = State.PriceShift;
+            foodHealth = config.Food.BoneMeatHealth; foodEnergy = config.Food.BoneMeatEnergy;
             loggedFarmerIds.Clear();
             SaveState();
             LogOnlineFarmers();
@@ -367,17 +491,43 @@ namespace SoopStardewBridge
 
         private void OnDayStarted(object? sender, DayStartedEventArgs e)
         {
+            // 시세 변동 기간이 끝나면 원래 가격으로 돌아간다 (모든 플레이어가 같은 날짜 기준으로 스스로 판단한다).
+            if (activeShift != null && Game1.Date.TotalDays >= activeShift.ExpiresDay)
+            {
+                activeShift = null;
+                if (Context.IsMainPlayer) { State.PriceShift = null; SaveState(); }
+                else Game1.addHUDMessage(new HUDMessage("시세 변동이 끝나 상점 가격이 원래대로 돌아왔습니다.", HUDMessage.newQuest_type));
+            }
             if (Context.IsMainPlayer) ProcessPendingRewards();
+        }
+
+        // 서버(JunimoServer)는 참가자가 메인 집에 들어가면 "Can't enter main building, porting to your own cabin"
+        // 귓속말을 보내고 자기 오두막으로 보낸다. 이동은 그대로 두고, 이 안내 문구만 채팅창에 그려지기 전에 지운다.
+        private static void HideMainBuildingNotice()
+        {
+            List<ChatMessage>? list = Game1.chatBox?.messages;
+            if (list == null || list.Count == 0) return;
+            for (int i = list.Count - 1; i >= Math.Max(0, list.Count - 5); i--)
+            {
+                string text = string.Concat(list[i].message.Select(s => s.message ?? ""));
+                string compact = new string(text.Where(c => !char.IsWhiteSpace(c)).ToArray());
+                if (compact.Contains("Can'tentermainbuilding", StringComparison.OrdinalIgnoreCase))
+                    list.RemoveAt(i);
+            }
         }
 
         private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
         {
+            if (!Context.IsMainPlayer) HideMainBuildingNotice();
+
             // 아이템 목록 확인은 게임 데이터가 준비된 뒤 게임 스레드에서 한다.
             if (lootNeedsCheck && Context.IsGameLaunched && Context.IsMainPlayer)
             {
                 lootNeedsCheck = false;
                 CheckLootItems(loot);
             }
+
+            if (Context.IsWorldReady) TrackBoneMeatEating();
 
             // 상자를 열었는데 서버가 답하지 않으면 다시 열 수 있게 풀어 준다.
             if (clientOpening && (DateTime.UtcNow - clientOpeningSince).TotalSeconds > 8)
@@ -404,6 +554,7 @@ namespace SoopStardewBridge
             {
                 LogOnlineFarmers();
                 onlineFarmerSnapshot = Game1.getOnlineFarmers().Select(f => f.UniqueMultiplayerID.ToString()).ToArray();
+                ApplyClockSpeed();
             }
 
             while (incomingEvents.TryDequeue(out DonationEvent? d))
@@ -474,37 +625,51 @@ namespace SoopStardewBridge
             SendToHost(MsgPendingRequest, new PendingRequestMessage { Reason = "query" });
         }
 
-        public void RequestClaim(string kind)
+        // 우편함 칸 하나(또는 한 페이지)를 받겠다고 호스트에 요청한다.
+        public void RequestClaimSlots(IReadOnlyList<MailSlot> slots)
         {
-            if (ClientWaiting) return;
+            if (ClientWaiting || slots.Count == 0) return;
 
-            // 받으려는 종류 중 하나도 인벤토리에 못 들어가면 요청하지 않는다 (보상은 서버 대기열에 그대로 남는다).
-            var kinds = kind == KindAll ? new[] { KindNormal, KindPremium, KindItem } : new[] { kind };
-            bool hasEmptySlot = Game1.player.Items.Take(Game1.player.MaxItems).Any(i => i == null) || Game1.player.Items.Count < Game1.player.MaxItems;
-            bool anyFits = kinds.Any(k => k switch
+            // 인벤토리에 들어가는 칸만 요청한다. 못 넣는 칸은 호스트 대기열에 그대로 남는다.
+            var fits = new List<MailSlot>();
+            foreach (MailSlot s in slots)
             {
-                KindItem => ClientPendingItems > 0 && (hasEmptySlot ||
-                    (CreateGrantItem(ClientFirstItemId, 1, 0) is Item first && Game1.player.couldInventoryAcceptThisItem(first))),
-                _ => (k == KindNormal ? ClientPendingChests : ClientPendingPremiumChests) > 0 &&
-                    Game1.player.couldInventoryAcceptThisItem(ItemRegistry.Create(ChestIdOf(k), 1))
-            });
-            if (!anyFits)
+                Item? item = CreateSlotItem(s);
+                if (item != null && Game1.player.couldInventoryAcceptThisItem(item)) fits.Add(s);
+            }
+            if (fits.Count == 0)
             {
                 Game1.playSound("cancel");
-                Game1.addHUDMessage(new HUDMessage("인벤토리에 공간이 없습니다. 한 칸 이상 비운 뒤 다시 수령하세요.", HUDMessage.error_type));
+                Game1.addHUDMessage(new HUDMessage(
+                    slots.Count == 1 ? "인벤토리가 가득 차 수령할 수 없습니다. 한 칸 이상 비운 뒤 다시 시도하세요."
+                                     : "인벤토리에 공간이 없어 수령할 수 없습니다. 한 칸 이상 비운 뒤 다시 시도하세요.",
+                    HUDMessage.error_type));
                 return;
             }
 
             ClientWaiting = true;
             ClientWaitingSince = DateTime.UtcNow;
-            SendToHost(MsgClaimRequest, new ClaimRequestMessage { Kind = kind });
+            SendToHost(MsgClaimRequest, new ClaimRequestMessage { Kind = KindAll, Slots = fits });
         }
 
+        // 우편함 칸에 그릴 아이템 (칸의 수량만큼 쌓인 상태)
+        public static Item? CreateSlotItem(MailSlot slot)
+        {
+            try
+            {
+                if (slot.Kind == KindItem) return CreateGrantItem(slot.ItemId, Math.Max(1, slot.Amount), slot.Quality);
+                Item chest = ItemRegistry.Create(ChestIdOf(slot.Kind), 1);
+                chest.Stack = Math.Max(1, Math.Min(slot.Amount, chest.maximumStackSize()));
+                return chest;
+            }
+            catch { return null; }
+        }
         private void OnClientPending(PendingMessage msg)
         {
             ClientPendingChests = Math.Max(0, msg.Chests);
             ClientPendingPremiumChests = Math.Max(0, msg.PremiumChests);
             ClientPendingItems = Math.Max(0, msg.Items);
+            ClientSlots = msg.Slots ?? new List<MailSlot>(); ClientSlotsVersion++;
             ClientFirstItemId = msg.FirstItemId ?? "";
             ClientWaiting = false;
 
@@ -589,9 +754,19 @@ namespace SoopStardewBridge
 
         private int AddToInventory(string itemId, int amount)
         {
-            if (amount <= 0) return 0;
-            Item? left = Game1.player.addItemToInventory(ItemRegistry.Create(itemId, amount));
-            return left?.Stack ?? 0;   // 못 넣은 개수
+            // 한 칸에 쌓을 수 있는 최대 개수씩 나눠 넣는다. 반환: 못 넣은 개수
+            int remaining = Math.Max(0, amount);
+            while (remaining > 0)
+            {
+                Item item = ItemRegistry.Create(itemId, 1);
+                int stack = Math.Min(remaining, Math.Max(1, item.maximumStackSize()));
+                item.Stack = stack;
+                Item? left = Game1.player.addItemToInventory(item);
+                int notPut = left?.Stack ?? 0;
+                remaining -= stack - notPut;
+                if (notPut > 0) break;
+            }
+            return remaining;
         }
 
         private void OnClientGrant(GrantMessage msg)
@@ -625,6 +800,7 @@ namespace SoopStardewBridge
             ClientPendingPremiumChests = Math.Max(0, msg.RemainingPremiumChests) + backPremium;
             ClientPendingItems         = Math.Max(0, msg.RemainingItems) + backItemCount;
             ClientFirstItemId          = backItems.FirstOrDefault()?.ItemId ?? msg.FirstItemId ?? "";
+            ClientSlots = msg.Slots ?? new List<MailSlot>(); ClientSlotsVersion++;   // 못 넣어 돌려보낸 몫은 호스트가 곧 새 목록으로 알려 준다
 
             if (addedNormal + addedPremium + gotItems > 0)
             {
@@ -751,12 +927,16 @@ namespace SoopStardewBridge
             {
                 Chests = normal, PremiumChests = premium, Reason = reason,
                 Items = items?.Sum(i => i.Amount) ?? 0, FirstItemId = items?.FirstOrDefault()?.ItemId ?? "",
-                LinkPageUrl = string.IsNullOrEmpty(baseUrl) ? "" : baseUrl + "/link/page"
+                LinkPageUrl = string.IsNullOrEmpty(baseUrl) ? "" : baseUrl + "/link/page",
+                Slots = BuildSlots(farmerId)
             });
         }
 
         private void OnHostPendingRequest(long fromId, PendingRequestMessage msg)
-            => SendPending(fromId, msg.Reason == "login" ? "login" : "query");
+        {
+            SendPending(fromId, msg.Reason == "login" ? "login" : "query");
+            if (msg.Reason == "login") SendToPlayer(fromId, MsgStateSync, BuildStateSync(false));   // 접속한 플레이어에게 시세 변동·음식 수치를 알려 준다
+        }
 
         private static int Take(Dictionary<long, int> dict, long farmerId, int max)
         {
@@ -769,10 +949,28 @@ namespace SoopStardewBridge
 
         private void OnHostClaimRequest(long fromId, ClaimRequestMessage msg)
         {
-            int normal  = msg.Kind is KindNormal  or KindAll ? Take(State.PendingChests,        fromId, MaxGrantPerClaim) : 0;
-            int premium = msg.Kind is KindPremium or KindAll ? Take(State.PendingPremiumChests, fromId, MaxGrantPerClaim) : 0;
+            int normal = 0, premium = 0;
             var items = new List<PendingItem>();
-            if (msg.Kind is KindItem or KindAll && State.PendingItems.Remove(fromId, out List<PendingItem>? taken)) items = taken;
+            if (msg.Slots is { Count: > 0 })
+            {
+                // 우편함에서 고른 칸만 받는다. 칸에 적힌 수량까지만, 실제 대기 중인 만큼만 내준다.
+                foreach (MailSlot s in msg.Slots.Take(MaxSlotsSent))
+                {
+                    int want = Math.Max(1, s.Amount);
+                    switch (s.Kind)
+                    {
+                        case KindNormal:  normal  += Take(State.PendingChests,        fromId, want); break;
+                        case KindPremium: premium += Take(State.PendingPremiumChests, fromId, want); break;
+                        case KindItem:    TakeItem(fromId, s.ItemId, s.Quality, want, items); break;
+                    }
+                }
+            }
+            else
+            {
+                normal  = msg.Kind is KindNormal  or KindAll ? Take(State.PendingChests,        fromId, int.MaxValue) : 0;
+                premium = msg.Kind is KindPremium or KindAll ? Take(State.PendingPremiumChests, fromId, int.MaxValue) : 0;
+                if (msg.Kind is KindItem or KindAll && State.PendingItems.Remove(fromId, out List<PendingItem>? taken)) items = taken;
+            }
 
             if (normal + premium > 0 || items.Count > 0)
             {
@@ -789,7 +987,8 @@ namespace SoopStardewBridge
             {
                 Chests = normal, PremiumChests = premium, Items = items,
                 RemainingChests = leftNormal, RemainingPremiumChests = leftPremium,
-                RemainingItems = leftItems?.Sum(i => i.Amount) ?? 0, FirstItemId = leftItems?.FirstOrDefault()?.ItemId ?? ""
+                RemainingItems = leftItems?.Sum(i => i.Amount) ?? 0, FirstItemId = leftItems?.FirstOrDefault()?.ItemId ?? "",
+                Slots = BuildSlots(fromId)
             });
         }
 
@@ -824,6 +1023,7 @@ namespace SoopStardewBridge
             }
             SaveState();
             Monitor.Log($"보상 반환(인벤토리 부족): FarmerId={fromId}, 일반={backNormal}, 고급={backPremium}, 아이템={backItems.Sum(i => i.Amount)}개", LogLevel.Info);
+            SendPending(fromId, "query");   // 돌려받은 몫까지 포함한 새 우편함 목록을 보낸다
         }
 
         private void OnHostOpenRequest(long fromId, OpenRequestMessage msg)
@@ -890,6 +1090,7 @@ namespace SoopStardewBridge
                         case MsgOpenRequest:    HandleHostMessage(e.Type, e.FromPlayerID, e.ReadAs<OpenRequestMessage>());    break;
                         case MsgLinkRequest:    HandleHostMessage(e.Type, e.FromPlayerID, e.ReadAs<LinkRequestMessage>());    break;
                         case MsgUnlinkRequest:  HandleHostMessage(e.Type, e.FromPlayerID, e.ReadAs<UnlinkRequestMessage>());  break;
+                        case MsgFestivalVote:   HandleHostMessage(e.Type, e.FromPlayerID, e.ReadAs<FestivalVoteMessage>());   break;
                     }
                 }
                 else
@@ -903,6 +1104,8 @@ namespace SoopStardewBridge
                         case MsgLinkResponse:   HandleClientMessage(e.Type, e.ReadAs<LinkResponseMessage>());   break;
                         case MsgUnlinkResponse: HandleClientMessage(e.Type, e.ReadAs<UnlinkResponseMessage>()); break;
                         case MsgLinkStatus:     HandleClientMessage(e.Type, e.ReadAs<LinkStatusMessage>());     break;
+                        case MsgNotice:         HandleClientMessage(e.Type, e.ReadAs<NoticeMessage>());         break;
+                        case MsgStateSync:      HandleClientMessage(e.Type, e.ReadAs<StateSyncMessage>());      break;
                     }
                 }
             }
@@ -922,6 +1125,7 @@ namespace SoopStardewBridge
                 case OpenRequestMessage m    when type == MsgOpenRequest:    OnHostOpenRequest(fromId, m);    break;
                 case LinkRequestMessage      when type == MsgLinkRequest:    OnHostLinkRequest(fromId);       break;
                 case UnlinkRequestMessage    when type == MsgUnlinkRequest:  OnHostUnlinkRequest(fromId);     break;
+                case FestivalVoteMessage     when type == MsgFestivalVote:   FestivalVote.OnVote(fromId);     break;
             }
         }
 
@@ -935,6 +1139,8 @@ namespace SoopStardewBridge
                 case LinkResponseMessage m   when type == MsgLinkResponse:   OnClientLinkResponse(m);   break;
                 case UnlinkResponseMessage m when type == MsgUnlinkResponse: OnClientUnlinkResponse(m); break;
                 case LinkStatusMessage m     when type == MsgLinkStatus:     OnClientLinkStatus(m);     break;
+                case NoticeMessage m         when type == MsgNotice:         ChatInfo(m.Text);          break;
+                case StateSyncMessage m      when type == MsgStateSync:      OnClientStateSync(m);      break;
             }
         }
 
@@ -942,6 +1148,14 @@ namespace SoopStardewBridge
         // 1) 플레이어 게임이 호스트에 요청 → 2) 호스트가 Central에서 로그인 주소와 세션 키를 받음
         // 3) 플레이어 PC의 기본 브라우저로 SOOP 로그인 → 4) 플레이어 PC에서 숨은 Edge가 Central 연결 페이지를 열어 SDK 연결
         // 숨은 Edge는 게임이 켜져 있는 동안만 동작한다. 게임을 끄거나 타이틀로 나가면 끈다.
+
+        // 호스트: 안내 문구를 플레이어 게임 채팅창에 노란 글씨로 띄운다. target이 null이면 접속 중인 모두에게.
+        public void Notice(long? target, string text)
+        {
+            var msg = new NoticeMessage { Text = text };
+            if (target is long one) { SendToPlayer(one, MsgNotice, msg); return; }
+            foreach (Farmer f in Game1.getOnlineFarmers()) SendToPlayer(f.UniqueMultiplayerID, MsgNotice, msg);
+        }
 
         private static void ChatInfo(string text)
         {
@@ -1005,6 +1219,16 @@ namespace SoopStardewBridge
                     clientLinkWaitingSince = null;
                     ChatInfo(msg.Message);
                     Game1.addHUDMessage(new HUDMessage(msg.Message, HUDMessage.achievement_type));
+                    Game1.playSound("reward");
+                    break;
+                case "loss":   // 손해 알림: 빨간 "에러" 표시 없이 일반 채팅 + 경고 알림으로 보여 준다
+                    ChatInfo(msg.Message);
+                    Game1.addHUDMessage(new HUDMessage(msg.Message, HUDMessage.error_type));
+                    Game1.playSound("cancel");
+                    break;
+                case "notice":
+                    ChatInfo(msg.Message);
+                    Game1.addHUDMessage(new HUDMessage(msg.Message, HUDMessage.newQuest_type));
                     Game1.playSound("reward");
                     break;
                 case "error":
@@ -1240,18 +1464,38 @@ namespace SoopStardewBridge
                 Farmer? farmer = FindOnlineFarmer(farmerId);
                 if (farmer?.currentLocation == null) continue;
 
+                // 한꺼번에 많이 소환하면 장소 동기화 데이터가 Steam 한도를 넘어 다른 플레이어 연결이 끊긴다.
+                // 그래서 1초에 MonsterSpawnPerSecond마리씩, 장소 안 몬스터가 MaxMonstersPerLocation 미만일 때만 소환하고 나머지는 대기열에 남긴다.
+                GameLocation loc = farmer.currentLocation;
+                // 병원(쓰러져서 실려 간 곳) 같은 소환 금지 장소, 축제, 쓰러진 상태에서는 소환하지 않고 기다린다.
+                if (!CanSpawnMonstersFor(farmer, loc)) continue;
+                int alive = loc.characters.Count(c => c is Monster);
+                int room  = Math.Max(0, Math.Max(1, config.MaxMonstersPerLocation) - alive);
+                int batch = Math.Min(entry.Value, Math.Min(room, Math.Max(1, config.MonsterSpawnPerSecond)));
+                if (batch <= 0) continue;   // 장소가 가득 참: 몬스터가 줄면 이어서 소환
+
                 var spawnedNames = new List<string>();
-                for (int i = 0; i < entry.Value; i++)
+                var announce = new Dictionary<string, (MonsterEntry Pick, int Count)>();
+                int spawned = 0;
+                for (int i = 0; i < batch; i++)
                 {
-                    Vector2 tile  = farmer.Tile;
-                    Vector2 spawn = new(tile.X + random.Next(-3, 4), tile.Y + random.Next(-3, 4));
+                    // 건물·울타리·나무·물 위처럼 막힌 칸에는 놓지 않는다 (몬스터가 끼어서 못 움직이는 문제)
+                    Vector2? spawn = FindMonsterSpawnTile(loc, farmer.Tile);
+                    if (spawn == null) break;   // 빈 칸이 없음: 남은 수는 다음에 소환
                     MonsterEntry pick = RollMonster();
-                    farmer.currentLocation.characters.Add(CreateMonster(pick.Type, spawn * 64f));
-                    spawnedNames.Add(string.IsNullOrWhiteSpace(pick.Name) ? pick.Type : pick.Name);
-                    AnnounceRareMonster(farmer, pick);
+                    loc.characters.Add(CreateMonster(pick.Type, spawn.Value * 64f));
+                    string name = string.IsNullOrWhiteSpace(pick.Name) ? pick.Type : pick.Name;
+                    spawnedNames.Add(name);
+                    announce[name] = announce.TryGetValue(name, out var a) ? (pick, a.Count + 1) : (pick, 1);
+                    spawned++;
                 }
-                State.PendingMonsters.Remove(farmerId);
-                Monitor.Log($"몬스터 소환 완료: FarmerId={farmerId}, 수량={entry.Value}, 종류={string.Join(", ", spawnedNames)}", LogLevel.Info);
+                if (spawned == 0) continue;
+                batch = spawned;
+                // 희귀 알림은 한 번에 묶어서 보낸다 (몬스터마다 보내면 채팅창이 도배됨)
+                foreach (var a in announce.Values) AnnounceRareMonster(farmer, a.Pick, a.Count);
+                int left = entry.Value - batch;
+                if (left > 0) State.PendingMonsters[farmerId] = left; else State.PendingMonsters.Remove(farmerId);
+                Monitor.Log($"몬스터 소환: FarmerId={farmerId}, {batch}마리 (남은 {left}, 장소 몬스터 {alive + batch}/{config.MaxMonstersPerLocation}), 종류={string.Join(", ", spawnedNames)}", LogLevel.Info);
                 SaveState();
             }
         }
@@ -1264,6 +1508,11 @@ namespace SoopStardewBridge
             if (e.NameWithoutLocale.IsEquivalentTo(NormalTextureAsset))
             {
                 e.LoadFromModFile<Texture2D>("assets/reward_chest.png", AssetLoadPriority.Exclusive);
+                return;
+            }
+            if (e.NameWithoutLocale.IsEquivalentTo(BoneMeatTextureAsset))
+            {
+                e.LoadFromModFile<Texture2D>("assets/bone_meat.png", AssetLoadPriority.Exclusive);
                 return;
             }
             if (e.NameWithoutLocale.IsEquivalentTo(PremiumTextureAsset))
@@ -1291,12 +1540,216 @@ namespace SoopStardewBridge
                         Type = "Basic", Category = 0, Price = 0,
                         Texture = PremiumTextureAsset, SpriteIndex = 0
                     };
+                    // 뼈고기: 기본 회복량은 0으로 두고, 먹기를 마치면 config의 체력/기력 수치를 직접 적용한다.
+                    shownFood = (foodHealth, foodEnergy);
+                    data[BoneMeatId] = new ObjectData
+                    {
+                        Name = BoneMeatId, DisplayName = "뼈고기",
+                        Description = $"뼈째 들고 뜯어 먹는 든든한 고기.^체력 +{Math.Max(0, foodHealth)}, 기력 +{Math.Max(0, foodEnergy)}",
+                        Type = "Cooking", Category = -7, Price = 0, Edibility = 0,
+                        Texture = BoneMeatTextureAsset, SpriteIndex = 0
+                    };
                 });
             }
         }
 
         // ── 감사 로그 ────────────────────────────────────────────────────────
 
+        // ── 우편함 칸 계산 (호스트) ──────────────────────────────────────────
+
+        private static int StackLimitOf(string itemId, int quality)
+            => CreateGrantItem(itemId, 1, quality)?.maximumStackSize() ?? 999;
+
+        // 대기 중인 보상을 "같은 아이템끼리 묶고, 한 칸 최대 개수에서 잘라" 칸 목록으로 만든다.
+        private List<MailSlot> BuildSlots(long farmerId)
+        {
+            var list = new List<MailSlot>();
+            void AddStacks(string kind, string itemId, int quality, int total, string name)
+            {
+                if (total <= 0) return;
+                int max = Math.Max(1, kind == KindItem ? StackLimitOf(itemId, quality) : (ItemRegistry.Create(itemId, 1)?.maximumStackSize() ?? 999));
+                while (total > 0 && list.Count < MaxSlotsSent)
+                {
+                    int n = Math.Min(total, max);
+                    list.Add(new MailSlot { Kind = kind, ItemId = itemId, Quality = quality, Amount = n, Name = name });
+                    total -= n;
+                }
+            }
+
+            State.PendingChests.TryGetValue(farmerId, out int normal);
+            State.PendingPremiumChests.TryGetValue(farmerId, out int premium);
+            AddStacks(KindNormal,  NormalChestId,  0, normal,  "SOOP 일반 상자");
+            AddStacks(KindPremium, PremiumChestId, 0, premium, "SOOP 고급 상자");
+            if (State.PendingItems.TryGetValue(farmerId, out List<PendingItem>? items))
+                foreach (var g in items.Where(i => i.Amount > 0).GroupBy(i => (i.ItemId, i.Quality)))
+                    AddStacks(KindItem, g.Key.ItemId, g.Key.Quality, g.Sum(i => i.Amount), g.First().Name);
+            return list;
+        }
+
+        // 대기 중인 지급 아이템에서 같은 ID·품질의 아이템을 want개까지 꺼내 into에 모은다.
+        private void TakeItem(long farmerId, string itemId, int quality, int want, List<PendingItem> into)
+        {
+            if (!State.PendingItems.TryGetValue(farmerId, out List<PendingItem>? list)) return;
+            foreach (PendingItem p in list)
+            {
+                if (want <= 0) break;
+                if (p.Amount <= 0 || p.ItemId != itemId || p.Quality != quality) continue;
+                int n = Math.Min(p.Amount, want);
+                p.Amount -= n; want -= n;
+                PendingItem? ex = into.FirstOrDefault(x => x.ItemId == p.ItemId && x.Quality == p.Quality);
+                if (ex != null) ex.Amount += n;
+                else into.Add(new PendingItem { ItemId = p.ItemId, Amount = n, Quality = p.Quality, Name = p.Name });
+            }
+            list.RemoveAll(p => p.Amount <= 0);
+            if (list.Count == 0) State.PendingItems.Remove(farmerId);
+        }
+
+        private void AddPendingItem(long farmerId, PendingItem add)
+        {
+            if (!State.PendingItems.TryGetValue(farmerId, out List<PendingItem>? list)) State.PendingItems[farmerId] = list = new List<PendingItem>();
+            PendingItem? ex = list.FirstOrDefault(x => x.ItemId == add.ItemId && x.Quality == add.Quality);
+            if (ex != null) ex.Amount += add.Amount; else list.Add(add);
+        }
+
+        // ── 세금 징수 / 시세 변동 / 음식 ─────────────────────────────────────
+
+        private void BroadcastNotice(string kind, string text)
+        {
+            var status = new LinkStatusMessage { Kind = kind, Message = text };
+            foreach (Farmer f in Game1.getOnlineFarmers()) SendToPlayer(f.UniqueMultiplayerID, MsgLinkStatus, status);
+        }
+
+        // 공용 자금에서 config의 Tax.Percent만큼 징수한다. 한 명의 후원으로 서버 전체 자금이 줄어든다.
+        private bool ApplyTax(out string error)
+        {
+            error = "";
+            if (Game1.player.team.useSeparateWallets.Value)
+            {
+                error = "개인 지갑 모드에서는 세금 징수를 지원하지 않습니다. (공용 지갑에서만 동작)";
+                return false;
+            }
+            int min = Math.Clamp(config.Tax.MinPercent, 0, 100), max = Math.Clamp(config.Tax.MaxPercent, 0, 100);
+            if (max < min) (min, max) = (max, min);   // 거꾸로 적어도 동작하게
+            int pct = random.Next(min, max + 1);
+            int before = Game1.player.Money;
+            int loss = (int)Math.Floor(before * (pct / 100.0));
+            if (loss > 0) Game1.player.Money = before - loss;
+            Monitor.Log($"세금 징수: 공용 자금 {before}G 중 {pct}% (설정 {min}~{max}%) = {loss}G", LogLevel.Info);
+            BroadcastNotice("loss", loss > 0
+                ? $"세금 징수! 공용 자금 {before:N0}G 중 {pct}%인 {loss:N0}G가 징수되었습니다."
+                : "세금 징수! 하지만 징수할 돈이 없습니다.");
+            return true;
+        }
+
+        // 새 시세 변동을 시작한다. 이미 진행 중이던 변동은 사라지고 새것으로 바뀐다.
+        private void ApplyPriceShiftJob()
+        {
+            PriceShiftConfig cfg = config.PriceShift;
+            State.PriceShift = new PriceShiftState
+            {
+                Seed = random.Next(),
+                ExpiresDay = Game1.Date.TotalDays + Math.Max(1, cfg.Days),
+                MaxIncreasePercent = Math.Clamp(cfg.MaxIncreasePercent, 0, 1000),
+                MaxDecreasePercent = Math.Clamp(cfg.MaxDecreasePercent, 0, 90)
+            };
+            activeShift = State.PriceShift;
+            SaveState();
+            Monitor.Log($"시세 변동 시작: +{State.PriceShift.MaxIncreasePercent}% / -{State.PriceShift.MaxDecreasePercent}% 범위, {Math.Max(1, cfg.Days)}일간", LogLevel.Info);
+            BroadcastState(announce: true);
+        }
+
+        private StateSyncMessage BuildStateSync(bool announce) => new()
+        {
+            PriceShift = State.PriceShift,
+            FoodHealth = config.Food.BoneMeatHealth,
+            FoodEnergy = config.Food.BoneMeatEnergy,
+            Announce = announce
+        };
+
+        private void BroadcastState(bool announce)
+        {
+            StateSyncMessage msg = BuildStateSync(announce);
+            foreach (Farmer f in Game1.getOnlineFarmers()) SendToPlayer(f.UniqueMultiplayerID, MsgStateSync, msg);
+        }
+
+        // 뼈고기 설명에 적힌 체력/기력 숫자를 config 값과 맞춘다 (값이 바뀌었을 때만 아이템 데이터를 다시 읽는다).
+        private (int, int) shownFood = (-1, -1);   // 아이템 데이터를 만들 때 쓴 값
+        private void RefreshBoneMeatText()
+        {
+            if (shownFood == (-1, -1) || shownFood == (foodHealth, foodEnergy)) return;
+            Helper.GameContent.InvalidateCache("Data/Objects");
+        }
+
+        private void OnClientStateSync(StateSyncMessage msg)
+        {
+            activeShift = msg.PriceShift;
+            foodHealth = Math.Max(0, msg.FoodHealth);
+            foodEnergy = Math.Max(0, msg.FoodEnergy);
+            RefreshBoneMeatText();
+            if (msg.Announce && activeShift != null && Context.IsWorldReady)
+            {
+                int days = Math.Max(1, activeShift.ExpiresDay - Game1.Date.TotalDays);
+                string text = $"시세 변동! 상점 가격이 아이템마다 달라집니다 (최대 +{activeShift.MaxIncreasePercent}% / -{activeShift.MaxDecreasePercent}%, {days}일간).";
+                ChatInfo(text);
+                Game1.addHUDMessage(new HUDMessage(text, HUDMessage.newQuest_type));
+                Game1.playSound("reward");
+            }
+        }
+
+        // 아이템 ID마다 같은 값이 나오는 "랜덤" 퍼센트: Seed가 같으면 모든 플레이어가 같은 가격을 본다.
+        private static int ShiftPercent(PriceShiftState st, string itemKey)
+        {
+            int up = Math.Max(0, st.MaxIncreasePercent), down = Math.Max(0, st.MaxDecreasePercent);
+            uint h = 2166136261u;
+            foreach (char ch in itemKey) { h ^= ch; h *= 16777619u; }
+            h ^= (uint)st.Seed; h *= 16777619u; h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+            return -down + (int)(h % (uint)(up + down + 1));
+        }
+
+        private void OnMenuChanged(object? sender, MenuChangedEventArgs e)
+        {
+            if (e.NewMenu is ShopMenu shop) ApplyShopPrices(shop);
+        }
+
+        // 상점이 열릴 때, 판매 중인 모든 아이템의 가격을 아이템별 퍼센트로 바꾼다. (골드로 사는 상점만)
+        private void ApplyShopPrices(ShopMenu shop)
+        {
+            PriceShiftState? st = activeShift;
+            if (st == null || !Context.IsWorldReady || Game1.Date.TotalDays >= st.ExpiresDay) return;
+            if (adjustedShops.TryGetValue(shop, out _)) return;
+            adjustedShops.Add(shop, new object());
+            if (shop.currency != 0) return;
+
+            foreach (ISalable key in shop.itemPriceAndStock.Keys.ToList())
+            {
+                ItemStockInformation info = shop.itemPriceAndStock[key];
+                if (info.TradeItem != null || info.Price <= 0) continue;
+                int pct = ShiftPercent(st, key.QualifiedItemId);
+                int price = Math.Max(1, (int)Math.Round(info.Price * (100 + pct) / 100.0));
+                if (price == info.Price) continue;
+                info.Price = price;
+                shop.itemPriceAndStock[key] = info;
+            }
+        }
+
+        // 뼈고기를 먹는 동작이 끝나는 순간 config의 체력/기력만큼 회복한다.
+        private void TrackBoneMeatEating()
+        {
+            Farmer? p = Game1.player;
+            if (p == null) return;
+            if (p.isEating)
+            {
+                if (p.itemToEat?.QualifiedItemId == "(O)" + BoneMeatId) boneEating = true;
+            }
+            else if (boneEating)
+            {
+                boneEating = false;
+                int h = Math.Max(0, foodHealth), s = Math.Max(0, foodEnergy);
+                p.health = Math.Min(p.maxHealth, p.health + h);
+                p.Stamina = Math.Min(p.MaxStamina, p.Stamina + s);
+                Game1.addHUDMessage(new HUDMessage($"뼈고기를 먹었습니다. 체력 +{h}, 기력 +{s}", HUDMessage.newQuest_type));
+            }
+        }
         private void LogOnlineFarmers()
         {
             foreach (Farmer farmer in Game1.getOnlineFarmers())
@@ -1357,7 +1810,7 @@ namespace SoopStardewBridge
                             if (!long.TryParse(ev.FarmerId, out long target)) continue;
                             var status = new LinkStatusMessage { Kind = ev.Kind, Message = ev.Message };
                             hostMainThreadActions.Enqueue(() => { if (FindOnlineFarmer(target) != null) SendToPlayer(target, MsgLinkStatus, status); });
-                            Monitor.Log($"SOOP 연동 알림 → FarmerId={target}: {ev.Message}", LogLevel.Info);
+                            Monitor.Log($"SOOP 알림 전달 → FarmerId={target} ({ev.Kind})", LogLevel.Info);   // 문구에 후원자 닉네임이 들어 있어 내용은 남기지 않는다
                         }
                     }
                     else if ((int)resp.StatusCode == 401)
@@ -1404,14 +1857,16 @@ namespace SoopStardewBridge
 
             listenerCancellation = new CancellationTokenSource();
             listener = new HttpListener();
-            listener.Prefixes.Add($"http://+:{config.Port}/");
+            // 예전 로컬 브리지가 후원을 직접 보내는 수신 포트. Windows에서는 관리자 권한 없이 열 수 있는 localhost로만 연다
+            // (스트리머 PC에는 필요 없음). 게임 서버(Docker, Linux)는 컨테이너 밖에서 들어오도록 모든 주소로 연다.
+            listener.Prefixes.Add(OperatingSystem.IsWindows() ? $"http://localhost:{config.Port}/" : $"http://+:{config.Port}/");
             try
             {
                 listener.Start();
                 _ = ListenLoopAsync(listener, listenerCancellation.Token);
             }
             catch (Exception ex)
-            { Monitor.Log($"HTTP 수신부 시작 실패: {ex}", LogLevel.Error); listener.Close(); listener = null; }
+            { Monitor.Log($"예전 연동용 수신 포트({config.Port})를 열지 못했습니다. 지금 연동 방식(/숲로그인)에는 영향이 없습니다: {ex.Message}", LogLevel.Trace); listener.Close(); listener = null; }
         }
 
         private async Task ListenLoopAsync(HttpListener httpListener, CancellationToken ct)
@@ -1495,24 +1950,24 @@ namespace SoopStardewBridge
             { Monitor.Log($"중복 이벤트 무시: {eventId}", LogLevel.Warn); return; }
 
             if (donation.Balloons <= 0)
-            { Monitor.Log($"잘못된 후원 수량: {soopId}", LogLevel.Warn); return; }
+            { Monitor.Log($"잘못된 후원 수량: {eventId}", LogLevel.Warn); return; }
 
-            long? targetFarmerId = donation.FarmerId > 0 ? donation.FarmerId : null;
+            long? targetFarmerId = donation.FarmerId != 0 ? donation.FarmerId : null;   // 플레이어 ID는 음수일 수 있다
             if (targetFarmerId == null)
-            { Monitor.Log($"FarmerId 없음 (soopId={soopId})", LogLevel.Warn); RememberEvent(eventId); return; }
+            { Monitor.Log($"FarmerId 없음 (event={eventId})", LogLevel.Warn); RememberEvent(eventId); return; }
 
             int balloons = donation.Balloons;
             var (normal, premium, monsters) = ComputeRewards(rules, balloons);   // rules.json 기준
 
             if (normal + premium + monsters == 0)
-            { RememberEvent(eventId); Monitor.Log($"보상 기준 미달: {soopId}, {balloons}개", LogLevel.Info); return; }
+            { RememberEvent(eventId); Monitor.Log($"보상 기준 미달: {balloons}개", LogLevel.Info); return; }
 
             AddPending(State.PendingChests,        targetFarmerId.Value, normal);
             AddPending(State.PendingPremiumChests, targetFarmerId.Value, premium);
             AddPending(State.PendingMonsters,      targetFarmerId.Value, monsters);
             RememberEvent(eventId);
 
-            Monitor.Log($"후원 이벤트 접수: {eventId}, {soopId}, {balloons}개 → 일반:{normal} 고급:{premium} 몬스터:{monsters}", LogLevel.Info);
+            Monitor.Log($"후원 이벤트 접수: {eventId}, {balloons}개 → 일반:{normal} 고급:{premium} 몬스터:{monsters}", LogLevel.Info);
             if (normal + premium > 0) NotifyPending(targetFarmerId.Value);
             ProcessPendingRewards();
         }
@@ -1525,7 +1980,7 @@ namespace SoopStardewBridge
             { Monitor.Log($"Central 중복 무시: {job.Id}", LogLevel.Warn); return true; }
 
             long? fid = job.GetFarmerIdLong();
-            if (fid == null || fid <= 0)
+            if (fid == null || fid == 0)   // 플레이어 ID는 음수일 수 있다
             { Monitor.Log($"Central FarmerId 없음: {job.Id}", LogLevel.Warn); error = "FarmerId가 없습니다."; return false; }
 
             switch (job.RewardType)
@@ -1533,6 +1988,11 @@ namespace SoopStardewBridge
                 case KindNormal:  AddPending(State.PendingChests,        fid.Value, job.Amount); break;
                 case KindPremium: AddPending(State.PendingPremiumChests, fid.Value, job.Amount); break;
                 case "monster":   AddPending(State.PendingMonsters,      fid.Value, job.Amount); break;
+                case KindTax:        if (!ApplyTax(out error)) return false; break;
+                case KindPriceShift: ApplyPriceShiftJob(); break;
+                case KindFood:
+                    AddPendingItem(fid.Value, new PendingItem { ItemId = "(O)" + BoneMeatId, Amount = Math.Max(1, job.Amount), Quality = 0, Name = "뼈고기" });
+                    break;
                 case KindItem:
                 {
                     // 게임에 없는 아이템 ID면 지급하지 않고 관리자 페이지에 '확인 필요'로 알린다.
@@ -1551,8 +2011,8 @@ namespace SoopStardewBridge
             }
 
             RememberEvent(jobKey);
-            Monitor.Log($"Central 보상 접수: {job.Id}, {job.SoopId}, {job.RewardType} {job.Amount}개{(job.RewardType == KindItem ? $" ({job.ItemId})" : "")}, FarmerId={fid}", LogLevel.Info);
-            if (job.RewardType is KindNormal or KindPremium or KindItem) NotifyPending(fid.Value);
+            Monitor.Log($"Central 보상 접수: {job.Id}, {job.RewardType} {job.Amount}개{(job.RewardType == KindItem ? $" ({job.ItemId})" : "")}, FarmerId={fid}", LogLevel.Info);
+            if (job.RewardType is KindNormal or KindPremium or KindItem or KindFood) NotifyPending(fid.Value);
             ProcessPendingRewards();
             return true;
         }
@@ -1601,6 +2061,26 @@ namespace SoopStardewBridge
             }
         }
 
+        // 하루 길이 (config.json의 ClockSpeed). 시간은 호스트가 흘리므로 호스트에서만 바꾸면 모두에게 적용된다.
+        // 1 = 원래 속도(하루 약 14분), 0.5 = 절반 속도(약 28분), 2 = 두 배 빠르게. 0.1~10 사이로 제한한다.
+        private int    defaultMsPerGameMinute = -1;
+        private double appliedClockSpeed = -1;
+        private void ApplyClockSpeed()
+        {
+            if (!Context.IsWorldReady || !Context.IsMainPlayer) return;
+            double speed = config.ClockSpeed;
+            if (double.IsNaN(speed) || speed <= 0) speed = 1;
+            speed = Math.Clamp(speed, 0.1, 10);
+            if (speed == appliedClockSpeed) return;
+            if (defaultMsPerGameMinute < 0) defaultMsPerGameMinute = Game1.realMilliSecondsPerGameMinute > 0 ? Game1.realMilliSecondsPerGameMinute : 700;
+            int ms = Math.Max(1, (int)Math.Round(defaultMsPerGameMinute / speed));
+            Game1.realMilliSecondsPerGameMinute = ms;
+            Game1.realMilliSecondsPerGameTenMinutes = ms * 10;
+            appliedClockSpeed = speed;
+            double dayMinutes = ms * 1200 / 60000.0;   // 오전 6시~새벽 2시 = 게임 시간 1200분
+            Monitor.Log($"하루 길이 변경: ClockSpeed={speed} → 게임 1분 = {ms}ms, 하루 약 {dayMinutes:0.#}분", LogLevel.Info);
+        }
+
         private void ReloadConfig()
         {
             DateTime stamp = StampOf(ConfigFileName);
@@ -1628,6 +2108,8 @@ namespace SoopStardewBridge
                 }
 
                 config = loaded;
+                if (Context.IsWorldReady && Context.IsMainPlayer)
+                    hostMainThreadActions.Enqueue(() => { foodHealth = config.Food.BoneMeatHealth; foodEnergy = config.Food.BoneMeatEnergy; RefreshBoneMeatText(); BroadcastState(false); });
                 Monitor.Log("config.json 변경을 반영했습니다.", LogLevel.Info);
             }
             catch (Exception ex)
@@ -1957,7 +2439,34 @@ namespace SoopStardewBridge
 
         // 드묾(rare)/아주 드묾(veryRare) 몬스터가 나오면 모든 플레이어 채팅창에 알린다.
         // 서버가 보내는 일반 채팅이라 플레이어 쪽 모드가 옛 버전이어도 보인다.
-        private void AnnounceRareMonster(Farmer farmer, MonsterEntry pick)
+        // 몬스터 소환 금지 장소: config.json NoMonsterLocations (기본: 병원). 축제와 쓰러진 상태에서도 소환하지 않는다.
+        private bool CanSpawnMonstersFor(Farmer farmer, GameLocation loc)
+        {
+            if (farmer.health <= 0 || farmer.passedOut || Game1.isFestival() || loc.currentEvent != null) return false;
+            foreach (string name in config.NoMonsterLocations ?? new List<string>())
+                if (!string.IsNullOrWhiteSpace(name) && (loc.Name.Equals(name, StringComparison.OrdinalIgnoreCase) || loc.NameOrUniqueName.Equals(name, StringComparison.OrdinalIgnoreCase)))
+                    return false;
+            return true;
+        }
+
+        // 플레이어 주변에서 몬스터를 놓을 수 있는 빈 칸을 찾는다 (가까운 곳부터, 최대 반경 6칸). 없으면 null.
+        private Vector2? FindMonsterSpawnTile(GameLocation loc, Vector2 center)
+        {
+            for (int radius = 2; radius <= 6; radius++)
+            {
+                for (int attempt = 0; attempt < 12; attempt++)
+                {
+                    Vector2 t = new((int)center.X + random.Next(-radius, radius + 1), (int)center.Y + random.Next(-radius, radius + 1));
+                    if (t == center) continue;
+                    if (!loc.isTileOnMap(t) || loc.isWaterTile((int)t.X, (int)t.Y)) continue;
+                    if (!loc.CanSpawnCharacterHere(t)) continue;   // 건물, 울타리, 나무, 돌, 가구 등이 있는 칸 제외
+                    return t;
+                }
+            }
+            return null;
+        }
+
+        private void AnnounceRareMonster(Farmer farmer, MonsterEntry pick, int count = 1)
         {
             MonstersFile file = monsters;
             string? template = pick.Rarity switch
@@ -1968,12 +2477,11 @@ namespace SoopStardewBridge
             };
             if (string.IsNullOrWhiteSpace(template)) return;
 
-            string monsterName = string.IsNullOrWhiteSpace(pick.Name) ? pick.Type : pick.Name;
+            string monsterName = (string.IsNullOrWhiteSpace(pick.Name) ? pick.Type : pick.Name) + (count > 1 ? $" {count}마리" : "");
             string text = template.Replace("{player}", farmer.Name).Replace("{monster}", monsterName);
             try
             {
-                Game1.Multiplayer.sendChatMessage(LocalizedContentManager.CurrentLanguageCode, text, Multiplayer.AllPlayers);
-                Game1.chatBox?.addInfoMessage(text);   // 호스트가 직접 플레이하는 경우 자기 화면에도 표시
+                Notice(null, text);   // 플레이어 게임에서 노란 안내로 표시 (서버 채팅은 한글이 깨짐)
                 Monitor.Log($"희귀 몬스터 안내: {text}", LogLevel.Info);
             }
             catch (Exception ex)
@@ -2041,6 +2549,50 @@ namespace SoopStardewBridge
             public string EdgePath     { get; set; } = "";
             // true = 화면 없이 실행, false = 작은 창으로 실행 (연결 문제를 눈으로 확인할 때)
             public bool   EdgeHeadless { get; set; } = true;
+            // 하루 길이(시계 속도). 1 = 원래, 0.5 = 하루가 두 배 길어짐, 2 = 두 배 짧아짐. 서버 config.json에서 바꾸면 2초 안에 적용
+            public double ClockSpeed   { get; set; } = 1.0;
+            // true = 한 Steam 계정은 캐릭터 하나만. 이미 캐릭터가 있으면 빈 칸(새 캐릭터)을 고를 수 없다 (게임 서버 config.json)
+            public bool   OneCharacterPerAccount { get; set; } = true;
+            // 몬스터 소환 속도와 상한. 한꺼번에 너무 많이 나오면 다른 플레이어 연결이 끊긴다 (Steam 전송 한도 초과)
+            public int    MonsterSpawnPerSecond  { get; set; } = 10;   // 1초에 소환하는 최대 수
+            public int    MaxMonstersPerLocation { get; set; } = 50; 
+            // 몬스터를 소환하지 않는 장소 이름. 그 장소에 있는 동안은 기다렸다가 나오면 소환 (기본: 병원)
+            public List<string> NoMonsterLocations { get; set; } = new() { "Hospital" };  // 한 장소에 있을 수 있는 몬스터 최대 수 (넘으면 줄어들 때까지 대기)
+            // true = 축제 메인 이벤트를 자동(5분 뒤)으로 시작하지 않고 /축제시작 투표로 시작. FestivalVoteRatio보다 많은 비율이 찬성하면 시작 (0.5 = 과반수)
+            public bool   FestivalVote      { get; set; } = true;
+            public double FestivalVoteRatio { get; set; } = 0.5;
+            // 공동 목표: 공용 돈을 모아 GoalGold를 제출. 기한은 GoalDeadlineYear년차 GoalDeadlineSeason(spring/summer/fall/winter) GoalDeadlineDay일이 끝날 때까지
+            public bool   GoalEnabled        { get; set; } = true;
+            public long   GoalGold           { get; set; } = 150000;
+            public int    GoalDeadlineYear   { get; set; } = 1;
+            public string GoalDeadlineSeason { get; set; } = "winter";
+            public int    GoalDeadlineDay    { get; set; } = 28;
+            // 이 숫자를 바꾸면(예: 0 → 1) 공동 목표가 한 번 초기화된다 (모은 금액 0, 달성/실패 해제). 제출한 돈은 돌려주지 않는다
+            public int    GoalResetCount     { get; set; } = 0;
+            // 후원 보상 수치 (호스트의 값이 모든 플레이어에게 적용된다)
+            public TaxConfig        Tax        { get; set; } = new();
+            public PriceShiftConfig PriceShift { get; set; } = new();
+            public FoodConfig       Food       { get; set; } = new();
+        }
+
+        private sealed class TaxConfig
+        {
+            // 세금: 징수할 때마다 MinPercent~MaxPercent 사이에서 무작위로 정한 %만큼 공용 자금을 징수한다 (0~100)
+            public int MinPercent { get; set; } = 10;
+            public int MaxPercent { get; set; } = 50;
+        }
+
+        private sealed class PriceShiftConfig
+        {
+            public int Days { get; set; } = 1;                    // 시세 변동이 유지되는 게임 내 일수
+            public int MaxIncreasePercent { get; set; } = 50;     // 아이템별 최대 상승폭(%)
+            public int MaxDecreasePercent { get; set; } = 50;     // 아이템별 최대 하락폭(%) (최대 90)
+        }
+
+        private sealed class FoodConfig
+        {
+            public int BoneMeatHealth { get; set; } = 50;         // 뼈고기를 먹으면 회복되는 체력
+            public int BoneMeatEnergy { get; set; } = 100;        // 뼈고기를 먹으면 회복되는 기력
         }
 
         private sealed class DonationEvent
@@ -2088,6 +2640,12 @@ namespace SoopStardewBridge
             public Dictionary<long, int> PendingPremiumChests { get; set; } = new();   // 고급 상자
             public Dictionary<long, int> PendingMonsters      { get; set; } = new();
             public Dictionary<long, List<PendingItem>> PendingItems { get; set; } = new();   // 관리자 지급 아이템
+            // 공동 목표 (GoalFeature.cs)
+            public long GoalSubmitted { get; set; }
+            public bool GoalAchieved  { get; set; }
+            public bool GoalFailed    { get; set; }
+            public int  GoalResetApplied { get; set; }   // 마지막으로 적용한 GoalResetCount
+            public PriceShiftState? PriceShift { get; set; }                                  // 진행 중인 시세 변동
         }
     }
 }
